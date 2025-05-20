@@ -1,0 +1,80 @@
+#include <Arduino.h>
+
+// Define pin numbers based on Pinouts.txt
+// G0, G1, G2, G3, G4, G5, G6, G7
+const int G_PINS[] = {16, 33, 34, 27, 28, 29, 14, 15};
+const int NUM_PINS = sizeof(G_PINS) / sizeof(G_PINS[0]);
+
+// State variable to track the currently active pin index (-1 means none are active)
+int currentPinIndex = -1;
+
+void setup() {
+  // Initialize Serial communication at 115200 baud
+  Serial.begin(115200);
+  // Optional: Wait for serial port to connect if using native USB.
+  // while (!Serial);
+
+  Serial.println("--- Sequential GPIO Pin Test Initializing ---");
+
+  // Configure each pin as an output and set initial state to LOW
+  for (int i = 0; i < NUM_PINS; i++) {
+    pinMode(G_PINS[i], OUTPUT);
+    digitalWrite(G_PINS[i], LOW); // Ensure pins start LOW
+  }
+
+  Serial.print("Configured ");
+  Serial.print(NUM_PINS);
+  Serial.println(" pins as OUTPUT and set LOW.");
+  Serial.println("Initialization Complete.");
+  Serial.println("Send any character via Serial Monitor to turn G0 HIGH.");
+}
+
+void loop() {
+  // Check if any data has been received on the Serial port
+  if (Serial.available() > 0) {
+    // Clear the serial buffer by reading all available characters
+    while (Serial.available() > 0) {
+      Serial.read();
+    }
+
+    Serial.println("--- Received Serial Input ---");
+
+    // --- Step 1: Turn OFF the previously active pin (if any) ---
+    if (currentPinIndex >= 0) {
+      int previousPin = G_PINS[currentPinIndex];
+      digitalWrite(previousPin, LOW);
+      Serial.print("Set Pin G");
+      Serial.print(currentPinIndex);
+      Serial.print(" (Arduino ");
+      Serial.print(previousPin);
+      Serial.println(") LOW.");
+    }
+
+    // --- Step 2: Advance to the next pin index ---
+    currentPinIndex++;
+
+    // --- Step 3: Check if we completed a full cycle ---
+    if (currentPinIndex >= NUM_PINS) {
+      Serial.println("----------------------------------");
+      Serial.println("Cycle Complete. All pins tested.");
+      Serial.println("Resetting sequence.");
+      Serial.println("Send any character to turn G0 HIGH again.");
+      Serial.println("----------------------------------");
+      currentPinIndex = -1; // Reset for the next cycle
+    }
+
+    // --- Step 4: Turn ON the new current pin (if not resetting) ---
+    if (currentPinIndex >= 0) {
+      int currentPin = G_PINS[currentPinIndex];
+      digitalWrite(currentPin, HIGH);
+      Serial.print("Set Pin G");
+      Serial.print(currentPinIndex);
+      Serial.print(" (Arduino ");
+      Serial.print(currentPin);
+      Serial.println(") HIGH.");
+      Serial.println("Send next character to advance...");
+    }
+  }
+
+  // No delay needed here as the program waits for Serial input
+}

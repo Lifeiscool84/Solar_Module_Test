@@ -1,0 +1,364 @@
+// SPI Flash test using SparkFun_SPI_SerialFlash library on Artemis MicroMod
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <SparkFun_SPI_SerialFlash.h> // SparkFun library
+#include <string.h> // Added for memset/memcmp
+
+// --- Constants ---
+// Use GPIO G0 on Artemis MicroMod
+const int PIN_FLASH_CS = 16; // G0 maps to Arduino Pin 16
+// const int PIN_FLASH_CS = D0; // D0 maps to GPIO 5
+const uint32_t TEST_ADDR = 0x000000; // Start address for testing (will be offset later)
+const uint16_t TEST_DATA_SIZE = 20; // How many bytes to write/read
+
+// --- Global Objects ---
+SFE_SPI_FLASH myFlash; // Create instance of the SparkFun flash library
+
+// --- Test Data Buffer ---
+#define MAX_BUFFER_SIZE 1024 // Use a 1KB buffer for transfers
+uint8_t transferBuffer[MAX_BUFFER_SIZE];
+uint8_t verifyBuffer[MAX_BUFFER_SIZE]; // Separate buffer for verification if needed
+
+// --- Function Prototypes ---
+void setup();
+void loop();
+void printBuffer(const char* label, uint8_t* buffer, uint16_t len);
+// Benchmark functions
+bool timedWriteTest(uint32_t startAddress, uint32_t dataSize);
+bool timedReadTest(uint32_t startAddress, uint32_t dataSize);
+
+// --- Test Parameters ---
+const uint32_t TEST_START_ADDRESS = 0x10000; // Start tests after first 64KB block
+const uint32_t TPP_MAX_MS = 5; // Max Page Program time from datasheet (3ms) + buffer
+
+const uint32_t dataSizes[] = {
+    1 * 1024,      // 1 KB
+    100 * 1024,    // 100 KB
+    500 * 1024,    // 500 KB 
+    // 4 * 1024 * 1024, // 4 MB - SKIPPED
+    // 8 * 1024 * 1024, // 8 MB - SKIPPED
+    // 14 * 1024 * 1024 // 14 MB - SKIPPED
+};
+const uint8_t numDataSizes = sizeof(dataSizes) / sizeof(dataSizes[0]);
+
+// --- Benchmark Functions ---
+
+// Performs a timed write test
+bool timedWriteTest(uint32_t startAddress, uint32_t dataSize) {
+    Serial.print("\n--- Write Test: Size=");
+    Serial.print(dataSize);
+    Serial.println(" bytes ---");
+
+    // *** Use Library Chip Erase ***
+    Serial.print("  Erasing entire chip (library erase)... ");
+    uint32_t eraseStartTime = millis();
+    myFlash.erase(); // Call erase without checking return value
+    // Wait for chip erase to complete (can be long!)
+    Serial.print(" Waiting for erase to finish...");
+    // Use a slightly longer wait just in case, given the datasheet minimum tCE
+    myFlash.blockingBusyWait(65000); // Increased timeout (65 seconds)
+    uint32_t eraseEndTime = millis();
+    // Removed the check for eraseRes != SFE_FLASH_CMD_SUCCESS
+    Serial.print(" done in "); Serial.print(eraseEndTime - eraseStartTime); Serial.println(" ms.");
+
+    // *** Erase Verification REMOVED ***
+
+    // Perform the write, chunk by chunk
+    Serial.print("  Writing data...");
+    unsigned long writeStartTime = micros();
+    uint32_t bytesRemaining = dataSize;
+    uint32_t currentAddress = startAddress;
+    sfe_flash_read_write_result_e writeResult = SFE_FLASH_READ_WRITE_SUCCESS;
+    // bool immediateVerifyOk = true; // No longer needed as verification is removed
+
+    while (bytesRemaining > 0) {
+        // Calculate bytes to write, respecting page boundaries (256 bytes)
+        uint16_t bytesToPageEnd = 256 - (currentAddress % 256);
+
+        // Determine the maximum number of bytes we *can* write in this iteration
+        // Start with bytes remaining, but ensure it fits in uint16_t for comparison
+        uint32_t writeSizeCandidate = bytesRemaining;
+
+        // Limit by page boundary
+        if (writeSizeCandidate > bytesToPageEnd) {
+            writeSizeCandidate = bytesToPageEnd;
+        }
+
+        // Limit by buffer size
+        if (writeSizeCandidate > MAX_BUFFER_SIZE) {
+            writeSizeCandidate = MAX_BUFFER_SIZE;
+        }
+
+        // Now it's safe to assign to uint16_t
+        uint16_t bytesToWrite = (uint16_t)writeSizeCandidate;
+        // *** Generate pattern for THIS chunk based on absolute offset ***
+        for (uint16_t i = 0; i < bytesToWrite; i++) {
+            uint32_t offsetInTotalData = (currentAddress - startAddress) + i;
+            transferBuffer[i] = (uint8_t)(offsetInTotalData % 256);
+        }
+        // *** End Pattern Generation ***
+
+        // --- Reverted to Library Write Block ---
+        // Call the library's writeBlock function
+        writeResult = myFlash.writeBlock(currentAddress, transferBuffer, bytesToWrite);
+        // Removed: delay(TPP_MAX_MS);
+        // --- End Reverted Write Block ---
+
+        // Check if writeBlock itself reported an error
+        if (writeResult != SFE_FLASH_READ_WRITE_SUCCESS) {
+            Serial.print("\n  ERROR: myFlash.writeBlock failed at address 0x"); Serial.print(currentAddress, HEX);
+            Serial.print(", Library Result code: "); Serial.println(writeResult);
+            // immediateVerifyOk = false; // No longer needed
+            break; // Exit the while loop
+        }
+
+        // *** Immediate Read-Back Verification REMOVED ***
+
+        bytesRemaining -= bytesToWrite;
+        currentAddress += bytesToWrite;
+        if (bytesRemaining > 0 && (dataSize - bytesRemaining) % (10*1024) == 0) {
+             Serial.print("."); // Progress indicator every 10KB
+        }
+    }
+    unsigned long writeEndTime = micros();
+
+    // Check only if writeBlock failed during the loop
+    if (writeResult != SFE_FLASH_READ_WRITE_SUCCESS) { 
+        Serial.println("  Write test failed (writeBlock error). "); // Adjusted message
+        return false;
+    }
+
+    Serial.println(" done."); // Update success message
+
+    // Calculate and print speed
+    unsigned long duration_us = writeEndTime - writeStartTime;
+    if (duration_us == 0) duration_us = 1; // Avoid division by zero
+    float speed_Bps = (float)dataSize * 1000000.0 / duration_us;
+    float speed_KBps = speed_Bps / 1024.0;
+    float speed_MBps = speed_KBps / 1024.0;
+
+    Serial.print("  Time: "); Serial.print(duration_us / 1000.0, 2); Serial.println(" ms");
+    Serial.print("  Speed: "); Serial.print(speed_Bps, 2); Serial.println(" B/s");
+    Serial.print("         "); Serial.print(speed_KBps, 2); Serial.println(" KB/s");
+    Serial.print("         "); Serial.print(speed_MBps, 4); Serial.println(" MB/s");
+
+    return true; // Return true if writeBlock never failed
+}
+
+// Performs a timed read test and verifies data
+bool timedReadTest(uint32_t startAddress, uint32_t dataSize) {
+    Serial.print("\n--- Read Test: Size=");
+    Serial.print(dataSize);
+    Serial.println(" bytes ---");
+
+    // Perform the read, chunk by chunk
+    Serial.print("  Reading data...");
+    unsigned long readStartTime = micros();
+    uint32_t bytesRemaining = dataSize;
+    uint32_t currentAddress = startAddress;
+    sfe_flash_read_write_result_e readResult = SFE_FLASH_READ_WRITE_SUCCESS;
+    bool verificationPassed = true;
+
+    // No need to pre-fill transferBuffer here anymore
+    // for (uint16_t i = 0; i < MAX_BUFFER_SIZE; i++) {
+    //     transferBuffer[i] = (uint8_t)(i % 256);
+    // }
+
+    while (bytesRemaining > 0) {
+        uint16_t bytesToRead = (bytesRemaining >= MAX_BUFFER_SIZE) ? MAX_BUFFER_SIZE : bytesRemaining;
+
+        // Ensure flash is ready before calling library read function
+        myFlash.blockingBusyWait(100);
+
+        // Clear the verify buffer before reading into it
+        memset(verifyBuffer, 0, bytesToRead);
+
+        readResult = myFlash.readBlock(currentAddress, verifyBuffer, bytesToRead);
+
+        if (readResult != SFE_FLASH_READ_WRITE_SUCCESS) {
+            Serial.print("\n  ERROR: Read failed at address 0x"); Serial.print(currentAddress, HEX);
+            Serial.print(", Result code: "); Serial.println(readResult);
+            verificationPassed = false; // Can't verify if read failed
+            break;
+        }
+
+        // --- UPDATED VERIFICATION LOGIC ---
+        // Verify this chunk byte by byte against the expected pattern
+        bool chunkOk = true;
+        for (uint16_t k = 0; k < bytesToRead; k++) {
+            // Calculate the expected byte based on its offset from the start of the test data
+            uint32_t offsetInTotalData = (currentAddress - startAddress) + k;
+            uint8_t expectedByte = (uint8_t)(offsetInTotalData % 256);
+
+            if (verifyBuffer[k] != expectedByte) {
+                 Serial.print("\n  ERROR: Verification failed at address 0x"); Serial.print(currentAddress + k, HEX);
+                 Serial.print("! Expected 0x"); if(expectedByte<0x10) Serial.print("0"); Serial.print(expectedByte, HEX);
+                 Serial.print(", Read 0x"); if(verifyBuffer[k]<0x10) Serial.print("0"); Serial.print(verifyBuffer[k], HEX);
+                 verificationPassed = false;
+                 chunkOk = false;
+                 // Decide whether to break or continue reading despite verification error
+                 // break; // Let's continue reading to see if pattern resumes
+            }
+        }
+        // --- END UPDATED VERIFICATION ---
+
+        bytesRemaining -= bytesToRead;
+        currentAddress += bytesToRead;
+         if (bytesRemaining > 0 && (dataSize - bytesRemaining) % (10*1024) == 0) {
+             Serial.print("."); // Progress indicator every 10KB
+        }
+    }
+    unsigned long readEndTime = micros();
+
+     if (readResult != SFE_FLASH_READ_WRITE_SUCCESS) {
+         Serial.println("  Read test failed.");
+         return false;
+     }
+
+    Serial.println(" done.");
+
+    // Calculate and print speed
+    unsigned long duration_us = readEndTime - readStartTime;
+    if (duration_us == 0) duration_us = 1; // Avoid division by zero
+    float speed_Bps = (float)dataSize * 1000000.0 / duration_us;
+    float speed_KBps = speed_Bps / 1024.0;
+    float speed_MBps = speed_KBps / 1024.0;
+
+    Serial.print("  Time: "); Serial.print(duration_us / 1000.0, 2); Serial.println(" ms");
+    Serial.print("  Speed: "); Serial.print(speed_Bps, 2); Serial.println(" B/s");
+    Serial.print("         "); Serial.print(speed_KBps, 2); Serial.println(" KB/s");
+    Serial.print("         "); Serial.print(speed_MBps, 4); Serial.println(" MB/s");
+    Serial.print("  Verification: "); Serial.println(verificationPassed ? "PASSED" : "FAILED");
+
+    return verificationPassed;
+}
+
+// --- Setup Function ---
+void setup() {
+    Serial.begin(115200);
+    unsigned long startMillis = millis();
+    while (!Serial && (millis() - startMillis < 5000)) {
+        delay(100);
+    }
+    Serial.println("\n-- SparkFun SPI SerialFlash Benchmark Test (W25Q128JV) --");
+
+    // Enable library debugging (optional, can be verbose)
+    // myFlash.enableDebugging(); // Keep disabled unless needed, it's very verbose
+
+    // *** Suggestion 3: Lower SPI Speed (for testing) ***
+    // Try initializing at a lower speed like 1MHz to rule out signal issues
+    long spiSpeed = 48000000; // Further reduced to 500 KHz
+    // long spiSpeed = 1000000; // 1 MHz
+    // long spiSpeed = 4000000; // Original 4 MHz
+    Serial.print("Initial Flash Check (CS="); Serial.print(PIN_FLASH_CS);
+    Serial.print(", Speed="); Serial.print(spiSpeed / 1000); Serial.println(" KHz)...");
+    // *** End Lower SPI Speed ***
+
+
+    if (!myFlash.begin(PIN_FLASH_CS, spiSpeed)) { // Use variable spiSpeed
+        Serial.println("ERROR: Initial SPI Flash check failed!");
+        while (1) delay(1); // Halt
+    }
+
+    // Read and Print IDs once
+    sfe_flash_manufacturer_e mfgID = myFlash.getManufacturerID();
+    uint16_t devID = myFlash.getDeviceID();
+    Serial.print("Flash Found: ");
+    if (mfgID != SFE_FLASH_MFG_UNKNOWN) {
+         Serial.print(myFlash.manufacturerIDString(mfgID));
+    } else {
+         Serial.print("Unknown Mfg (0x");
+         if(myFlash.getRawManufacturerID() < 0x10) Serial.print("0");
+         Serial.print(myFlash.getRawManufacturerID(), HEX);
+         Serial.print(")");
+    }
+    Serial.print(" / Device ID: 0x");
+    if (devID < 0x1000) Serial.print("0");
+    if (devID < 0x100) Serial.print("0");
+    if (devID < 0x10) Serial.print("0");
+    Serial.println(devID, HEX);
+
+    // Check if JEDEC ID matches Winbond W25Q128JV (0xEF7018 or 0xEF4018)
+    bool idMatch = false;
+    if (mfgID == SFE_FLASH_MFG_WINBOND) {
+        if (devID == 0x7018 || devID == 0x4018) { // Check for either variant
+            idMatch = true;
+        }
+    }
+
+    if (!idMatch) {
+         Serial.print("Warning: JEDEC ID (0x");
+         if(myFlash.getRawManufacturerID() < 0x10) Serial.print("0");
+         Serial.print(myFlash.getRawManufacturerID(), HEX);
+         Serial.print(" / 0x");
+         if (devID < 0x1000) Serial.print("0");
+         if (devID < 0x100) Serial.print("0");
+         if (devID < 0x10) Serial.print("0");
+         Serial.print(devID, HEX);
+         Serial.println(") doesn't match expected W25Q128JV (EF / 7018 or 4018).");
+    }
+
+
+    Serial.println("\nReady to start benchmarks. This will ERASE and WRITE data!");
+    Serial.println("Starting in 5 seconds...");
+    delay(5000);
+
+}
+
+// --- Loop Function ---
+void loop() {
+    Serial.println("\n=========================================");
+    Serial.println("           Starting Benchmark Run          ");
+    Serial.println("=========================================");
+
+    // Iterate through data sizes
+    for (int j = 0; j < numDataSizes; j++) {
+        uint32_t currentSize = dataSizes[j];
+
+        // Check if size exceeds chip capacity (16MB = 0x1000000)
+        // Leave some headroom
+        if (TEST_START_ADDRESS + currentSize > 0x1000000) { // Check against 16MB limit
+             Serial.print("Skipping size "); Serial.print(currentSize/1024);
+             Serial.println(" KB - Exceeds chip capacity.");
+             continue;
+        }
+
+
+        // Perform Write Test (includes erase)
+        bool writeOk = timedWriteTest(TEST_START_ADDRESS, currentSize);
+
+        // Perform Read Test only if write was successful
+        if (writeOk) {
+            timedReadTest(TEST_START_ADDRESS, currentSize);
+        } else {
+            Serial.println("Skipping Read Test due to Write Failure.");
+        }
+
+        delay(1000); // Pause briefly between size tests
+    } // End data size loop
+
+    Serial.println("\n=========================================");
+    Serial.println("           Benchmark Run Complete          ");
+    Serial.println("=========================================");
+    Serial.println("Halting. Reset board to run again.");
+
+    // Halt execution after one full run
+    while(1) { delay(100); }
+}
+
+// --- Helper printBuffer ---
+void printBuffer(const char* label, uint8_t* buffer, uint16_t len) {
+    Serial.print(label);
+    Serial.print(" [");
+    uint16_t printLen = (len > 64) ? 64 : len; // Print up to 64 bytes
+    for(uint16_t i = 0; i < printLen; i++) { // Use printLen here
+        if(buffer[i] < 0x10) Serial.print("0");
+        Serial.print(buffer[i], HEX);
+        if (i < printLen - 1) Serial.print(" ");
+    }
+    if (len > printLen) { // Indicate if truncated
+        Serial.print(" ...");
+    }
+    Serial.println("]");
+}

@@ -1,0 +1,9 @@
+# Project Coding Rules
+
+1.  **Top-Level Declarations**: Ensure that all global variables, constants, structs, classes, and enums are declared at the top of the file *before* `setup()` or any function that uses them.
+2.  **Pin Number Constants**: As part of Top-Level Declarations (Rule 1), define all pin numbers used via `const int` or `#define`. Use descriptive names relating to the pin's function and designation (e.g., `const int PIN_STATUS_LED_G0 = 16;`). Avoid using raw pin numbers directly in functions like `pinMode()`, `digitalWrite()`, `analogRead()`.
+3.  **Pin Function Comments**: Add comments next to each pin definition explaining its specific purpose in your project (e.g., `const int PIN_TEMP_SENSOR_G5 = 29; // Reads analog value from temperature sensor`).
+4.  **Forward Declarations**: Always include forward declarations (prototypes) for any custom functions that are defined *after* their first use (e.g., helper functions defined below `setup()` or `loop()` but called within them). Place these prototypes after global declarations but before `setup()`.
+5.  **ADC Voltage Compliance**: For pins used as ADC inputs (Pins 16, 33, 34, 29, 14, 15), explicitly verify and document that the connected input signal respects the 0-2V range specified in `Documents/Pinouts.txt`. Implement voltage scaling (e.g., a voltage divider) if the signal might exceed this limit.
+6.  **PWM Pin Selection**: When using `analogWrite()`, preferentially select pins marked as PWM capable (Pins 16, 33, 34, 27, 28, 29, 14, 15). Document whether the pin is used for PWM or simple digital I/O.
+7.  **Feature-Based Pin Choice**: Choose pins based on the minimum required features (GPIO, ADC, PWM). If only basic digital I/O is needed, consider using non-ADC pins (like 27, 28) if available, to keep ADC pins free for analog tasks. 

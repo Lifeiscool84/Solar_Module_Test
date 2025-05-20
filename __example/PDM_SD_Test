@@ -1,0 +1,356 @@
+#include <Arduino.h>
+#include <PDM.h>         // PDM library for Apollo3
+#include <SPI.h>         // Required for SD card
+#include <SD.h>          // Standard SD card library
+
+// --- Debugging Options ---
+#define VERBOSE_DEBUG 1 // Set to 1 for detailed prints, 0 to disable
+
+// --- Configuration ---
+const int USER_SD_CS_PIN        = 8;         // SD card chip select pin. VERIFY THIS MATCHES YOUR HARDWARE!
+const char *FILENAME            = "RECORD.RAW"; // Output filename on the SD card
+const uint32_t PDM_CLOCK_FREQ_HZ = 1500000;   // Target PDM Clock Freq (1.5 MHz for AM_HAL_PDM_CLK_1_5MHZ)
+
+// PDM Configuration (aiming for ~8kHz Mono)
+const am_hal_pdm_config_t pdmConfig = {
+    .eClkDivider        = AM_HAL_PDM_MCLKDIV_1,
+    .eLeftGain          = AM_HAL_PDM_GAIN_P90DB, // Adjust gain as needed
+    .eRightGain         = AM_HAL_PDM_GAIN_P90DB, // Adjust gain as needed
+    .ui32DecimationRate = 94, // Results in ~7.98 kHz (PDM_CLOCK_FREQ_HZ / (1*2*94))
+    .bHighPassEnable    = 0,
+    .ui32HighPassCutoff = 0xB,
+    .ePDMClkSpeed       = AM_HAL_PDM_CLK_1_5MHZ,   // MUST correspond to PDM_CLOCK_FREQ_HZ
+    .bInvertI2SBCLK     = 0,
+    .ePDMClkSource      = AM_HAL_PDM_INTERNAL_CLK,
+    .bPDMSampleDelay    = 0,
+    .bDataPacking       = 1,                       // 16-bit samples
+    .ePCMChannels       = AM_HAL_PDM_CHANNEL_LEFT, // Mono Left
+    .ui32GainChangeDelay= 1,
+    .bI2SEnable         = 0,
+    .bSoftMute          = 0,
+    .bLRSwap            = 0
+};
+
+// --- Buffers ---
+// Define flush threshold
+const uint32_t FLUSH_THRESHOLD_BYTES = 8 * 1024; // 8 KB flush threshold
+
+// Large RAM buffer allocation (Needs to be at least FLUSH_THRESHOLD_BYTES)
+// Keeping it larger allows for potential future adjustments without reallocation.
+const uint32_t RAM_BUFFER_SIZE_BYTES = 64 * 1024; // 64 KB RAM buffer space (Reduced from 256KB to save RAM)
+uint8_t ramBuffer[RAM_BUFFER_SIZE_BYTES];         // The main buffer
+uint32_t ramBufferBytesFilled = 0;                // Current fill level
+
+// PDM Transfer Buffer (Should be <= FLUSH_THRESHOLD_BYTES)
+const uint32_t PDM_TRANSFER_BUFFER_SAMPLES = 4096; // 4096 samples = 8192 bytes
+const uint32_t PDM_TRANSFER_BUFFER_BYTES   = PDM_TRANSFER_BUFFER_SAMPLES * sizeof(uint16_t);
+uint16_t pdmTransferBuffer[PDM_TRANSFER_BUFFER_SAMPLES]; // Buffer to get data from PDM lib
+
+// --- Global Objects ---
+AP3_PDM myPDM;
+File audioFile;
+volatile bool recordingActive = false; // Volatile might not be strictly needed but is safe
+
+// --- Debug Counters & Flags ---
+#if VERBOSE_DEBUG
+volatile uint32_t pdmAvailableCount = 0;
+volatile uint32_t pdmGetDataCount   = 0;
+volatile uint32_t pdmOverrunCount   = 0;
+volatile uint32_t sdWriteAttemptCount = 0;
+volatile uint32_t sdWriteSuccessCount = 0;
+volatile uint32_t sdWriteFailCount    = 0;
+volatile bool     anyNonZeroDataSeen = false;
+unsigned long lastDebugPrintMillis = 0;
+const unsigned long DEBUG_PRINT_INTERVAL = 1000; // Print debug summary every second
+#endif
+
+// --- Function Prototypes ---
+void startRecording();
+void stopRecording();
+void processAudioData();
+void flushToSD();
+void printPdmConfiguration();
+void printSdCardInfo();
+
+// --- Setup ---
+void setup() {
+    Serial.begin(115200);
+    delay(500);
+    Serial.println("\n--- PDM to SD Card Recorder (Non-RTOS, 8KB Flush) ---");
+
+    // Check buffer sizes sanity
+    if (FLUSH_THRESHOLD_BYTES > RAM_BUFFER_SIZE_BYTES) {
+        Serial.println("SETUP ERROR: FLUSH_THRESHOLD > RAM_BUFFER_SIZE! Halting.");
+        while(1);
+    }
+    if (PDM_TRANSFER_BUFFER_BYTES > FLUSH_THRESHOLD_BYTES) {
+        Serial.println("SETUP WARNING: PDM_TRANSFER_BUFFER > FLUSH_THRESHOLD. This might delay flushing.");
+    }
+
+    // Initialize SD Card
+    Serial.print("Initializing SD card (CS Pin: "); Serial.print(USER_SD_CS_PIN); Serial.print(")...");
+    pinMode(USER_SD_CS_PIN, OUTPUT);
+    digitalWrite(USER_SD_CS_PIN, HIGH);
+    if (!SD.begin(USER_SD_CS_PIN)) {
+        Serial.println(" Card failed! Halting.");
+        while (1);
+    }
+    Serial.println(" Card initialized.");
+    printSdCardInfo();
+
+    // Initialize PDM
+    Serial.print("Initializing PDM microphone...");
+    if (!myPDM.begin()) {
+        Serial.println(" PDM Init failed! Halting.");
+        while (1);
+    }
+    Serial.println(" PDM Initialized.");
+
+    // Configure PDM
+    Serial.print("Attempting to configure PDM...");
+    if (!myPDM.updateConfig(pdmConfig)) {
+        Serial.println(" PDM Config update command failed! Halting.");
+        while (1);
+    }
+    Serial.println(" PDM Config command sent.");
+    Serial.println("Verifying actual PDM configuration:");
+    printPdmConfiguration();
+    uint32_t calculatedSampleRate = PDM_CLOCK_FREQ_HZ / (1 * 2 * pdmConfig.ui32DecimationRate);
+    Serial.print("--> CALCULATED Target Sample Rate: ~"); Serial.print(calculatedSampleRate); Serial.println(" Hz");
+
+    // Start Recording
+    startRecording();
+}
+
+// --- Main Loop ---
+void loop() {
+    if (recordingActive) {
+        processAudioData();
+    } else {
+        delay(100); // Reduce CPU usage when idle
+    }
+
+#if VERBOSE_DEBUG
+    // Periodic Status Update
+    if (millis() - lastDebugPrintMillis >= DEBUG_PRINT_INTERVAL) {
+        lastDebugPrintMillis = millis();
+        Serial.print("[STATS] Available: "); Serial.print(pdmAvailableCount);
+        Serial.print(" | getData: "); Serial.print(pdmGetDataCount);
+        Serial.print(" | Overruns: "); Serial.print(pdmOverrunCount); // Total overruns
+        Serial.print(" | SD Writes (A/S/F): "); Serial.print(sdWriteAttemptCount);
+        Serial.print("/"); Serial.print(sdWriteSuccessCount);
+        Serial.print("/"); Serial.print(sdWriteFailCount);
+        // Report Buffer Fill relative to the FLUSH threshold now
+        Serial.print(" | Buffer Fill: "); Serial.print(ramBufferBytesFilled); Serial.print("/"); Serial.println(FLUSH_THRESHOLD_BYTES); // Show fill vs threshold
+        pdmAvailableCount = 0; // Reset periodic counters
+        pdmGetDataCount = 0;
+    }
+#endif
+    // Stop condition check placeholder
+}
+
+// --- Helper Functions ---
+
+void startRecording() {
+    Serial.print("Starting recording to "); Serial.print(FILENAME); Serial.println("...");
+    if (SD.exists(FILENAME)) {
+        Serial.println("  File exists. Deleting old file.");
+        if (!SD.remove(FILENAME)) {
+             Serial.println("  ERROR: Failed to remove existing file!");
+        }
+    }
+    audioFile = SD.open(FILENAME, FILE_WRITE);
+    if (!audioFile) {
+        Serial.println("  ERROR opening file for writing! Halting.");
+        while(1);
+    }
+    Serial.println("  File opened successfully.");
+
+    // Perform small test write AFTER opening successfully
+    Serial.println("  Attempting small test write...");
+    uint8_t testData[] = {0xDE, 0xAD, 0xBE, 0xEF};
+    size_t testWritten = audioFile.write(testData, sizeof(testData));
+    if (testWritten == sizeof(testData)) {
+        Serial.println("  Small test write SUCCESSFUL.");
+        unsigned long flushStart = millis();
+        audioFile.flush(); // Ensure it's written
+        unsigned long flushEnd = millis();
+        Serial.print("  Flush after test write took: "); Serial.print(flushEnd - flushStart); Serial.println(" ms");
+    } else {
+        Serial.print("  Small test write FAILED! Wrote "); Serial.print(testWritten); Serial.println(" bytes. Halting.");
+        audioFile.close();
+        while(1);
+    }
+
+    ramBufferBytesFilled = 0;
+    recordingActive = true;
+#if VERBOSE_DEBUG
+    Serial.println("  Debug counters reset (Incl Overruns).");
+    pdmAvailableCount = 0;
+    pdmGetDataCount   = 0;
+    pdmOverrunCount   = 0; // Reset overruns at start of recording
+    sdWriteAttemptCount = 0;
+    sdWriteSuccessCount = 0;
+    sdWriteFailCount    = 0;
+    anyNonZeroDataSeen = false;
+    lastDebugPrintMillis = millis();
+#endif
+}
+
+void stopRecording() {
+    if (!recordingActive) return;
+    Serial.println("\nStopping recording...");
+    recordingActive = false;
+    if (ramBufferBytesFilled > 0) {
+        Serial.print("  Flushing final "); Serial.print(ramBufferBytesFilled); Serial.println(" bytes before closing...");
+        flushToSD(); // Write remaining data
+    }
+    if (audioFile) {
+        // Optional final flush before close
+        // unsigned long flushStart = millis();
+        // audioFile.flush();
+        // unsigned long flushEnd = millis();
+        // Serial.print("  Final flush took: "); Serial.print(flushEnd - flushStart); Serial.println(" ms");
+        audioFile.close();
+        Serial.println("  File closed.");
+    } else {
+        Serial.println("  Warning: File object was not valid on stop.");
+    }
+    Serial.println("Recording stopped.");
+}
+
+void processAudioData() {
+    // Use a temporary flag to track if an overrun happened *during this specific getData call*
+    bool overrunOccurred = false;
+
+    // Check PDM.available() status BEFORE reading
+    if (myPDM.available()) {
+#if VERBOSE_DEBUG
+        pdmAvailableCount++;
+#endif
+        // Read data into the PDM transfer buffer
+        uint32_t bytesRead = myPDM.getData(pdmTransferBuffer, PDM_TRANSFER_BUFFER_BYTES);
+
+        // Check overrun status *immediately after* reading
+        if (myPDM.isOverrun()) {
+            overrunOccurred = true; // Mark that an overrun happened related to this read attempt
+#if VERBOSE_DEBUG
+            pdmOverrunCount++; // Increment total count
+            Serial.println(" >>> PDM Overrun Detected! <<< ");
+#endif
+        }
+
+        // Process the data if any was read successfully
+        if (bytesRead > 0) {
+#if VERBOSE_DEBUG
+            pdmGetDataCount++;
+            if (!anyNonZeroDataSeen) { // Check for non-zero data
+                uint16_t* samplePtr = pdmTransferBuffer;
+                for(size_t i = 0; i < (bytesRead / sizeof(uint16_t)); ++i) {
+                    if (samplePtr[i] != 0 && samplePtr[i] != 0xFFFF) {
+                        anyNonZeroDataSeen = true;
+                        Serial.println("[DEBUG] First non-zero data seen.");
+                        break;
+                    }
+                }
+                 if (pdmGetDataCount > 10 && !anyNonZeroDataSeen) { 
+                     Serial.println("[DEBUG] Warning: Only zero/0xFFFF data read from PDM so far.");
+                 }
+            }
+#endif
+            // Copy data to the main RAM buffer only if NO overrun occurred during this read
+            // to potentially avoid using corrupted data (though overrun means prior data was lost anyway)
+            if (!overrunOccurred) {
+                 if ((ramBufferBytesFilled + bytesRead) <= RAM_BUFFER_SIZE_BYTES) {
+                    memcpy(ramBuffer + ramBufferBytesFilled, pdmTransferBuffer, bytesRead);
+                    ramBufferBytesFilled += bytesRead;
+                 } else {
+                     Serial.println("ERROR: RAM buffer space EXCEEDED! Discarding data.");
+                     // This should ideally not happen if flush threshold is appropriate
+                     ramBufferBytesFilled = 0; // Optionally reset buffer to prevent repeated errors
+                     stopRecording(); // Stop if buffer logic fails
+                 }
+            } else {
+                // Optionally discard data read *after* an overrun was detected
+                // Serial.println("[DEBUG] Discarding data read after overrun detection.");
+            }
+        }
+    } // End if(myPDM.available())
+
+    // Check if RAM buffer has enough data to warrant a flush (8KB threshold)
+    // Perform this check *outside* the myPDM.available() block,
+    // so flushing happens even if PDM isn't immediately available.
+    if (ramBufferBytesFilled >= FLUSH_THRESHOLD_BYTES) { // Flush when 8KB full
+        flushToSD();
+    }
+}
+
+
+// Function to Flush RAM Buffer to SD Card
+void flushToSD() {
+    if (ramBufferBytesFilled == 0) {
+        return; // Nothing to flush
+    }
+#if VERBOSE_DEBUG
+    sdWriteAttemptCount++;
+    Serial.print("[DEBUG] Flushing RAM buffer. Attempting SD Write #"); Serial.print(sdWriteAttemptCount);
+    Serial.print(" ("); Serial.print(ramBufferBytesFilled); Serial.print(" bytes)...\n");
+#endif
+    unsigned long totalWriteStart = millis();
+    bool writeError = false;
+    // Store the amount to flush *before* potentially modifying ramBufferBytesFilled elsewhere
+    uint32_t bytesToFlush = ramBufferBytesFilled;
+
+    // Directly write the amount currently in the buffer
+    size_t bytesWritten = audioFile.write(ramBuffer, bytesToFlush);
+
+    if (bytesWritten == bytesToFlush) {
+         // Write was successful
+         writeError = false;
+    } else {
+        // Write failed
+        writeError = true;
+#if VERBOSE_DEBUG
+        Serial.print(" \n--- FAILED! --- Wrote "); Serial.print(bytesWritten); Serial.print(" / "); Serial.print(bytesToFlush); Serial.println(" bytes.");
+#endif
+    }
+
+    // --- Removed chunking loop - trying direct write first ---
+
+    unsigned long totalWriteEnd = millis();
+    if (!writeError) {
+#if VERBOSE_DEBUG
+        sdWriteSuccessCount++;
+        Serial.print("[DEBUG] Buffer flush SUCCESSFUL. Total time: ");
+        Serial.print(totalWriteEnd - totalWriteStart); Serial.println(" ms");
+#endif
+    } else {
+#if VERBOSE_DEBUG
+        sdWriteFailCount++;
+#endif
+        Serial.println("ERROR: SD Card write failed! Stopping recording.");
+        // Attempt to close the file cleanly even on error? Maybe not if write failed...
+        stopRecording(); // Stop recording as the write failed
+    }
+
+    // Reset buffer fill level only after successful write or handled error
+    ramBufferBytesFilled = 0;
+}
+
+// --- Debug Helper Functions ---
+void printPdmConfiguration() {
+    Serial.print("  - Clock Speed Enum (Readback): "); Serial.println(myPDM.getClockSpeed());
+    Serial.print("  - Clock Divider Enum (Readback): "); Serial.println(myPDM.getClockDivider());
+    Serial.print("  - Decimation Rate (Readback): "); Serial.println(myPDM.getDecimationRate());
+    Serial.print("  - Left Gain Enum (Readback): "); Serial.println(myPDM.getLeftGain());
+    Serial.print("  - Right Gain Enum (Readback): "); Serial.println(myPDM.getRightGain());
+    Serial.print("  - Channel Enum (Readback): "); Serial.println(myPDM.getChannel());
+    Serial.print("  - (Intended Clock Hz for calculation: "); Serial.print(PDM_CLOCK_FREQ_HZ); Serial.println(")");
+}
+
+void printSdCardInfo() {
+    Serial.print("  Card Info: (Functionality temporarily disabled due to SD lib differences/linter errors)\n");
+    /* // Temporarily comment out body
+    ...
+    */
+}
