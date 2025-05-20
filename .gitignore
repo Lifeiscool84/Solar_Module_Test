@@ -1,5 +1,68 @@
+# PlatformIO build artifacts
+.pio/
+build_temp/
+__pycache__/
+.history/
+
+# Build and debug files
+*.o
+*.d
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+*.bak
+*.tmp
+*.log
+
+# IDE files
+.vscode/
+.settings/
+.idea/
+*.iml
+
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# Embedded git repositories
+github-mcp-server/
+
+# Files with very long paths
+lib/SparkFun_u-blox_GNSS_Arduino_Library/examples/AssistNow/
+lib/SparkFun_u-blox_GNSS_Arduino_Library/examples/
+
+# Let's maintain only the core files for version control
+# Keep only our main source code
+!src/
+
 .pio
 .vscode/.browse.c_cpp.db*
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Added by Claude Task Master
+# Logs
+logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+dev-debug.log
+# Dependency directories
+node_modules/
+# Environment variables
+.env
+# Editor directories and files
+.idea
+.vscode
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+# OS specific
+# Task files
+tasks.json
+tasks/ 
