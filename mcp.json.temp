@@ -1,0 +1,30 @@
+{
+    "mcpServers":  {
+                       "sequential-thinking":  {
+                                                   "args":  [
+                                                                "C:\\Users\\lifei\\AppData\\Roaming\\npm\\node_modules\\@modelcontextprotocol\\server-sequential-thinking\\dist\\index.js"
+                                                            ],
+                                                   "command":  "C:\\Program Files\\nodejs\\node.exe"
+                                               },
+                       "taskmaster":  {
+                                          "args":  [
+                                                       "-y",
+                                                       "task-master-mcp"
+                                                   ],
+                                          "command":  "npx"
+                                      },
+                       "context7":  {
+                                        "args":  [
+                                                     "-y",
+                                                     "@upstash/context7-mcp@latest"
+                                                 ],
+                                        "command":  "npx"
+                                    },
+                       "brave-search":  {
+                                            "args":  [
+                                                         "C:\\Users\\lifei\\AppData\\Roaming\\npm\\node_modules\\@modelcontextprotocol\\server-brave-search\\dist\\index.js"
+                                                     ],
+                                            "command":  "C:\\Program Files\\nodejs\\node.exe"
+                                        }
+                   }
+}

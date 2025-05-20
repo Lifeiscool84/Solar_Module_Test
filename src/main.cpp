@@ -29,7 +29,7 @@ float battery_current_lsb = 0.0001; // 100uA per bit
 float load_current_lsb = 0.0001;    // 100uA per bit
 
 // Function prototypes
-bool initINA228(uint8_t address, float shuntOhms = 0.015, float maxCurrent = 5.0);
+float initINA228(uint8_t address, float shuntOhms = 0.015, float maxCurrent = 5.0);
 float readBusVoltage(uint8_t address);
 float readShuntVoltage(uint8_t address);
 float readCurrent(uint8_t address, float current_lsb_value);
@@ -60,24 +60,23 @@ void setup() {
 
   // Store the returned current_lsb values
   solar_current_lsb = initINA228(INA_SOLAR_ADDR, 0.015, 5.0);
-  battery_current_lsb = initINA228(INA_BATTERY_ADDR, 0.015, 5.0);
-  load_current_lsb = initINA228(INA_LOAD_ADDR, 0.015, 5.0);
-
-  if (solar_current_lsb) {
+  if (solar_current_lsb > 0) {
     Serial.println(F("INA228 Solar Panel Monitor (0x40) Initialized."));
   } else {
     Serial.print(F("Failed to initialize INA228 Solar Panel Monitor at 0x"));
     Serial.println(INA_SOLAR_ADDR, HEX);
   }
 
-  if (battery_current_lsb) {
-    Serial.println(F("INA228 Battery Power Monitor (0x42) Initialized."));
+  battery_current_lsb = initINA228(INA_BATTERY_ADDR, 0.015, 5.0);
+  if (battery_current_lsb > 0) {
+    Serial.println(F("INA228 Battery Power Monitor (0x44) Initialized."));
   } else {
     Serial.print(F("Failed to initialize INA228 Battery Power Monitor at 0x"));
     Serial.println(INA_BATTERY_ADDR, HEX);
   }
 
-  if (load_current_lsb) {
+  load_current_lsb = initINA228(INA_LOAD_ADDR, 0.015, 5.0);
+  if (load_current_lsb > 0) {
     Serial.println(F("INA228 Load Power Monitor (0x41) Initialized."));
   } else {
     Serial.print(F("Failed to initialize INA228 Load Power Monitor at 0x"));
@@ -112,7 +111,7 @@ void loop() {
   Serial.println();
 
   // INA228 Battery Power Monitor Data
-  Serial.println(F("Battery Power Monitor (0x42):"));
+  Serial.println(F("Battery Power Monitor (0x44):"));
   Serial.print(F("  Bus Voltage:   ")); Serial.print(readBusVoltage(INA_BATTERY_ADDR)); Serial.println(F(" V"));
   Serial.print(F("  Shunt Voltage: ")); Serial.print(readShuntVoltage(INA_BATTERY_ADDR)); Serial.println(F(" mV"));
   Serial.print(F("  Current:       ")); Serial.print(readCurrent(INA_BATTERY_ADDR, battery_current_lsb)); Serial.println(F(" mA"));
@@ -132,11 +131,11 @@ void loop() {
   delay(3000); 
 }
 
-bool initINA228(uint8_t address, float shuntOhms, float maxCurrent) {
+float initINA228(uint8_t address, float shuntOhms, float maxCurrent) {
   // Check if the device is responding
   Wire.beginTransmission(address);
   if (Wire.endTransmission() != 0) {
-    return false;
+    return 0.0f; // Return 0 to indicate failure
   }
   
   // Reset the device
@@ -148,8 +147,12 @@ bool initINA228(uint8_t address, float shuntOhms, float maxCurrent) {
   delay(10); // Wait for reset to complete
   
   // Calculate calibration value
-  float device_current_lsb = maxCurrent / 32768.0;
-  uint32_t calibration = (uint32_t)((0.00032768 / (device_current_lsb * shuntOhms)) * 8192);
+  // Correct calculation per datasheet: INA228 current register is 20-bit signed (2^19 for magnitude)
+  float device_current_lsb = maxCurrent / 524288.0f; // 2^19 = 524288
+  
+  // Calculate SHUNT_CAL value based on datasheet formula
+  // For ADCRANGE=0 (default, ±163.84mV range): SHUNT_CAL = 13107.2 * 10^6 * CURRENT_LSB * R_SHUNT
+  uint16_t calibration = (uint16_t)(13107.2f * 1000000.0f * device_current_lsb * shuntOhms);
   
   // Write calibration value to SHUNTCAL register
   Wire.beginTransmission(address);
@@ -157,42 +160,46 @@ bool initINA228(uint8_t address, float shuntOhms, float maxCurrent) {
   Wire.write((uint8_t)((calibration >> 8) & 0xFF)); // MSB, explicitly cast to uint8_t
   Wire.write((uint8_t)(calibration & 0xFF));         // LSB, explicitly cast to uint8_t
   if (Wire.endTransmission() != 0) {
-    return false;
+    return 0.0f; // Return 0 to indicate failure
   }
   
-  return true;
+  return device_current_lsb; // Return the calculated current_lsb on success
 }
 
 float readBusVoltage(uint8_t address) {
   uint32_t value = readRegister(address, INA228_REG_VBUS, 3);
   // Calculate voltage in volts (195.3125 uV per LSB)
-  return (float)(value >> 4) * 195.3125 / 1000000.0;
+  return (float)(value >> 4) * 195.3125f / 1000000.0f;
 }
 
 float readShuntVoltage(uint8_t address) {
-  int32_t value = (int32_t)readRegister(address, INA228_REG_VSHUNT, 3);
+  int32_t raw_value = (int32_t)readRegister(address, INA228_REG_VSHUNT, 3);
   // Sign extend 24-bit value to 32-bit
-  if (value & 0x800000) {
-    value |= 0xFF000000;
+  if (raw_value & 0x800000) {
+    raw_value |= 0xFF000000;
   }
+  // Shift the value right by 4 bits to isolate the 20-bit data, as lower 4 bits are reserved
+  int32_t shifted_value = raw_value >> 4; 
   // Calculate shunt voltage in mV (312.5 nV per LSB)
-  return (float)value * 0.0003125;
+  return (float)shifted_value * 0.0003125f;
 }
 
 float readCurrent(uint8_t address, float current_lsb_value) {
-  int32_t value = (int32_t)readRegister(address, INA228_REG_CURRENT, 3);
+  int32_t raw_value = (int32_t)readRegister(address, INA228_REG_CURRENT, 3);
   // Sign extend 24-bit value to 32-bit
-  if (value & 0x800000) {
-    value |= 0xFF000000;
+  if (raw_value & 0x800000) {
+    raw_value |= 0xFF000000;
   }
+  // Shift the value right by 4 bits to isolate the 20-bit data, as lower 4 bits are reserved
+  int32_t shifted_value = raw_value >> 4;
   // Calculate current in mA
-  return (float)value * current_lsb_value * 1000.0;
+  return (float)shifted_value * current_lsb_value * 1000.0f;
 }
 
 float readPower(uint8_t address, float current_lsb_value) {
   uint32_t value = readRegister(address, INA228_REG_POWER, 3);
   // Calculate power in mW (power LSB = 3.2 * current_lsb)
-  return (float)value * 3.2 * current_lsb_value * 1000.0;
+  return (float)value * 3.2f * current_lsb_value * 1000.0f;
 }
 
 uint32_t readRegister(uint8_t address, uint8_t reg, uint8_t numBytes) {
