@@ -3,17 +3,12 @@
 #include <SPI.h>
 #include <SD.h>
 #include <SparkFun_RV8803.h>
-#include <SparkFun_u-blox_GNSS_Arduino_Library.h>
 
 // BH1750 Light Sensor
 hp_BH1750 lightMeter; // Uses default I2C address 0x23
 
 // RV8803 Real-Time Clock
 RV8803 rtc;
-
-// GNSS Module
-SFE_UBLOX_GNSS myGNSS;
-bool isGNSSFixed = false;
 
 // SD Card Configuration
 const int chipSelect = 8; // SD card CS pin
@@ -25,14 +20,8 @@ const unsigned long LOG_INTERVAL = 1000; // Log every 1 second (1000ms)
 // Central Time Zone Configuration
 // Central Standard Time (CST) = UTC-6 hours = -24 quarter hours
 // Central Daylight Time (CDT) = UTC-5 hours = -20 quarter hours
-// Default to CDT to match current local time requirement
-int8_t currentTimeZone = -20; // Start with CDT (-5 hours in quarter hours)
-
-// GNSS Time Synchronization Configuration
-bool gnssTimeSyncEnabled = true;           // Enable automatic GNSS time sync
-unsigned long lastGnssTimeSync = 0;        // Last time we synced with GNSS
-const unsigned long GNSS_SYNC_INTERVAL = 2UL * 60UL * 60UL * 1000UL; // 2 hours in milliseconds
-bool startupGnssTimeSyncDone = false;      // Track if we did startup sync
+// Default to CST, user can change via serial if needed
+int8_t currentTimeZone = -24; // Start with CST (-6 hours in quarter hours)
 
 // Define I2C addresses for INA228 sensors
 const uint8_t INA_SOLAR_ADDR = 0x40;
@@ -58,12 +47,9 @@ const uint8_t INA228_REG_DEVICE_ID = 0x3F; // Corrected name
 const float SHUNT_OHMS_PROGRAMMED = 0.015f;
 
 // Battery-specific calibration values (measured with 4-wire method)
-// IMPORTANT: Battery monitoring uses direct calculation approach instead of chip calibration
-// Effective resistance accounts for parasitic resistance in PCB traces and connections
-// Current is calculated as: I = V_shunt / R_effective
-// Power preserves sign: P = V * I (negative = charging, positive = discharging)
-const float EFFECTIVE_SHUNT_OHMS_BATTERY = 0.0177186f; // Effective resistance including parasitic resistance
-const float MAX_CURRENT_BATTERY = 5.0f; // Maximum expected current for battery monitoring
+const float EFFECTIVE_SHUNT_OHMS_BATTERY = 0.0177186f; // From V_INA_shunt / I_multimeter
+const float BATTERY_INA228_ANOMALY_FACTOR = 2.18453f; // Correction factor for battery readings
+const float MAX_CURRENT_BATTERY = 5.0f; // Keep original max current design
 
 // Calibration and scaling variables
 float solar_current_lsb = 0.0f;
@@ -73,25 +59,16 @@ float load_current_lsb = 0.0f;
 // Data structure for logging
 struct SensorData {
   unsigned long timestamp_ms; // Keep millis for timing
-  char date_str[12];          // Date in YYYY-MM-DD format
-  char time_str[10];          // Time in HH:MM:SS military format (24-hour)
+  char timestamp_iso[25];     // ISO 8601 timestamp from RTC (YYYY-MM-DDTHH:MM:SS)
   float lux;
-  // GPS coordinates
-  float latitude;
-  float longitude;
-  bool gps_fix;
-  int gps_satellites;
-  // Solar sensor data
   float solar_voltage;
   float solar_current;
   float solar_power;
   float solar_temperature;
-  // Battery sensor data
   float battery_voltage;
   float battery_current;
   float battery_power;
   float battery_temperature;
-  // Load sensor data
   float load_voltage;
   float load_current;
   float load_power;
@@ -119,14 +96,6 @@ void handleSerialTimeCommands();
 void printRTCStatus();
 void setTimeZone(bool isDST);
 void updateRTCTimestamp(SensorData& data);
-// GNSS Functions
-bool initGNSS();
-void readGNSSData(SensorData& data);
-bool validateGnssData();
-// GNSS Time Sync Functions
-bool syncRTCWithGNSS();
-bool syncRTCWithGNSSLocal();
-void checkPeriodicGNSSTimeSync();
 // handleTimeAdjustmentCommands() function removed
 // Enhanced menu functions for RTC adjustment
 void showRealTimeDisplay();
@@ -319,38 +288,6 @@ void setup() {
     Serial.println(F(" Failed to initialize!"));
   }
 
-  // Initialize GNSS
-  Serial.print(F("Initializing GNSS..."));
-  if (initGNSS()) {
-    Serial.println(F(" GNSS online!"));
-    
-    // Enhanced startup GNSS time sync with retry mechanism
-    if (gnssTimeSyncEnabled) {
-      Serial.println(F("GNSS Time Sync: Checking for immediate GPS fix..."));
-      
-      // First attempt: Check if GPS already has a fix (rare but possible)
-      if (syncRTCWithGNSSLocal()) {
-        Serial.println(F("GNSS Time Sync: Immediate sync successful!"));
-        startupGnssTimeSyncDone = true;
-        lastGnssTimeSync = millis();
-      } else {
-        Serial.println(F("GNSS Time Sync: No immediate fix available."));
-        Serial.println(F("GPS modules typically need 30-90 seconds for cold start."));
-        Serial.println(F("Time sync will be attempted automatically when GPS gets a fix."));
-        Serial.println(F("Manual sync available with 'g' command during real-time display."));
-        
-        // For better debugging, show current GPS status
-        SensorData tempData;
-        readGNSSData(tempData);
-        Serial.print(F("Current GPS status: "));
-        Serial.print(tempData.gps_satellites);
-        Serial.println(F(" satellites visible"));
-      }
-    }
-  } else {
-    Serial.println(F(" GNSS initialization failed!"));
-  }
-
   // Initialize SD Card
   Serial.print(F("Initializing SD card..."));
   if (initSDCard()) {
@@ -408,8 +345,6 @@ battery_current_lsb = initINA228(
   Serial.println(F("--------------------------------------------------"));
   Serial.println(F("SETUP COMPLETE - Entering main data collection loop"));
   Serial.println(F("Data collection will run regardless of serial connection status"));
-  Serial.println(F("\nDATA FORMAT: Clean display updates every second"));
-  Serial.println(F("Battery Power: Negative=Charging, Positive=Discharging"));
   Serial.flush(); // Ensure all setup messages are sent
   lastLogTime = millis();
 }
@@ -421,110 +356,49 @@ void loop() {
   if (currentTime - lastLogTime >= LOG_INTERVAL) {
     SensorData data = readAllSensors();
     
-    // Enhanced GNSS time sync check with detailed debugging
-    if (gnssTimeSyncEnabled && data.gps_fix) {
-      // Calculate time since last sync
-      unsigned long timeSinceLastSync = currentTime - lastGnssTimeSync;
-      
-      // Debug output for sync timing (show every 30 seconds when GPS is fixed)
-      static unsigned long lastSyncDebug = 0;
-      if (currentTime - lastSyncDebug > 30000) { // Every 30 seconds
-        Serial.print(F("GNSS Sync Debug: GPS Fix="));
-        Serial.print(data.gps_fix ? "YES" : "NO");
-        Serial.print(F(", Sats="));
-        Serial.print(data.gps_satellites);
-        Serial.print(F(", Time since last sync="));
-        Serial.print(timeSinceLastSync / 1000);
-        Serial.print(F("s, Interval="));
-        Serial.print(GNSS_SYNC_INTERVAL / 1000);
-        Serial.println(F("s"));
-        lastSyncDebug = currentTime;
-      }
-      
-      // Check if it's time for sync
-      if (timeSinceLastSync >= GNSS_SYNC_INTERVAL) {
-        Serial.print(F("GNSS Sync Trigger: Time since last sync ("));
-        Serial.print(timeSinceLastSync / 1000);
-        Serial.print(F("s) >= interval ("));
-        Serial.print(GNSS_SYNC_INTERVAL / 1000);
-        Serial.println(F("s)"));
-        checkPeriodicGNSSTimeSync();
-      }
-      
-      // Special case: If this is the first GPS fix and no sync has been done yet
-      if (lastGnssTimeSync == 0 && !startupGnssTimeSyncDone) {
-        Serial.println(F("GNSS Sync Trigger: First GPS fix detected, attempting immediate sync..."));
-        if (syncRTCWithGNSSLocal()) {
-          Serial.println(F("First GPS sync successful!"));
-          lastGnssTimeSync = millis();
-          startupGnssTimeSyncDone = true;
-        } else {
-          Serial.println(F("First GPS sync failed - will retry on next interval"));
-        }
-      }
-    } else if (gnssTimeSyncEnabled && !data.gps_fix) {
-      // Show why sync is not happening (every minute when no GPS)
-      static unsigned long lastNoGpsDebug = 0;
-      if (currentTime - lastNoGpsDebug > 60000) { // Every 60 seconds
-        Serial.print(F("GNSS Sync Status: No GPS fix ("));
-        Serial.print(data.gps_satellites);
-        Serial.println(F(" satellites) - sync not possible"));
-        lastNoGpsDebug = currentTime;
-      }
-    }
-    
     // Debug output to show data collection is running (even without serial monitor)
     static unsigned long debugCounter = 0;
     debugCounter++;
     
     // Print to serial for monitoring (only if connected)
     if (Serial) {
-      // Print simplified data format every reading
-      Serial.print(data.time_str); Serial.print(F(" | "));
-      Serial.print(F("GPS:")); Serial.print(data.gps_fix ? F("YES") : F("NO"));
-      Serial.print(F("(")); Serial.print(data.gps_satellites); Serial.print(F(") | "));
-      
-      // Solar: voltage/current/power
-      Serial.print(F("Solar: ")); Serial.print(data.solar_voltage, 2); Serial.print(F("V/"));
-      Serial.print(data.solar_current, 1); Serial.print(F("mA/"));
-      Serial.print(data.solar_power, 1); Serial.print(F("mW | "));
-      
-      // Battery: voltage/current/power + status
-      Serial.print(F("Battery: ")); Serial.print(data.battery_voltage, 2); Serial.print(F("V/"));
-      Serial.print(data.battery_current, 1); Serial.print(F("mA/"));
-      Serial.print(data.battery_power, 1); Serial.print(F("mW "));
-      if (data.battery_current > 0.5) {
-        Serial.print(F("(DISCHARGING)"));
-      } else if (data.battery_current < -0.5) {
-        Serial.print(F("(CHARGING)"));
-      } else {
-        Serial.print(F("(IDLE)"));
-      }
-      Serial.print(F(" | "));
-      
-      // Load: voltage/current/power
-      Serial.print(F("Load: ")); Serial.print(data.load_voltage, 2); Serial.print(F("V/"));
-      Serial.print(data.load_current, 1); Serial.print(F("mA/"));
-      Serial.print(data.load_power, 1); Serial.print(F("mW"));
-      
-      Serial.println(); // End of line
-      
-      // Show periodic status confirmation (every 60 seconds)
-      if (debugCounter % 60 == 1) {
-        Serial.print(F("STATUS: Reading #"));
+      // Show periodic status to confirm data collection is running
+      if (debugCounter % 10 == 1) { // Every 10 seconds
+        Serial.print(F("DATA COLLECTION ACTIVE - Reading #"));
         Serial.print(debugCounter);
-        Serial.print(F(" | Date: "));
-        Serial.print(data.date_str);
-        if (data.gps_fix) {
-          Serial.print(F(" | GPS: "));
-          Serial.print(data.latitude, 6);
-          Serial.print(F(","));
-          Serial.print(data.longitude, 6);
-        }
-        Serial.println();
+        Serial.print(F(" at "));
+        Serial.println(data.timestamp_iso);
       }
       
-      // Temperature warnings (only for critical temperatures)
+      Serial.println(F("\n--- Sensor Readings ---"));
+      Serial.print(F("Time: ")); Serial.println(data.timestamp_iso);
+      Serial.print(F("Light: ")); Serial.print(data.lux); Serial.println(F(" lx"));
+      
+      Serial.print(F("Solar: ")); Serial.print(data.solar_voltage, 3); Serial.print(F("V, ")); 
+      Serial.print(data.solar_current, 2); Serial.print(F("mA, ")); 
+      Serial.print(data.solar_power, 2); Serial.print(F("mW, "));
+      Serial.print(data.solar_temperature, 1); Serial.println(F("°C"));
+      
+      Serial.print(F("Battery: ")); Serial.print(data.battery_voltage, 3); Serial.print(F("V, ")); 
+      Serial.print(data.battery_current, 2); Serial.print(F("mA, ")); 
+      Serial.print(data.battery_power, 2); Serial.print(F("mW, "));
+      Serial.print(data.battery_temperature, 1); Serial.println(F("°C"));
+      
+      Serial.print(F("Load: ")); Serial.print(data.load_voltage, 3); Serial.print(F("V, ")); 
+      Serial.print(data.load_current, 2); Serial.print(F("mA, ")); 
+      Serial.print(data.load_power, 2); Serial.print(F("mW, "));
+      Serial.print(data.load_temperature, 1); Serial.println(F("°C"));
+      
+      // Battery status indication
+      if (data.battery_current > 0) {
+        Serial.println(F("Battery Status: CHARGING"));
+      } else if (data.battery_current < 0) {
+        Serial.println(F("Battery Status: DISCHARGING"));
+      } else {
+        Serial.println(F("Battery Status: IDLE"));
+      }
+      
+      // Temperature warnings
       float maxTemp = data.solar_temperature;
       if (data.battery_temperature > maxTemp) maxTemp = data.battery_temperature;
       if (data.load_temperature > maxTemp) maxTemp = data.load_temperature;
@@ -542,23 +416,8 @@ void loop() {
         Serial.print(minTemp, 1); Serial.println(F("°C"));
       }
       
-      // Power calculation verification (every 60 readings)
-      if (debugCounter % 60 == 1) {
-        Serial.println(F("POWER VERIFICATION: V*I vs Sensor"));
-        Serial.print(F("Solar: "));
-        Serial.print(data.solar_voltage * data.solar_current, 1);
-        Serial.print(F(" vs "));
-        Serial.print(data.solar_power, 1);
-        Serial.print(F(" mW | Battery: "));
-        Serial.print(data.battery_voltage * data.battery_current, 1);
-        Serial.print(F(" vs "));
-        Serial.print(data.battery_power, 1);
-        Serial.print(F(" mW | Load: "));
-        Serial.print(data.load_voltage * data.load_current, 1);
-        Serial.print(F(" vs "));
-        Serial.print(data.load_power, 1);
-        Serial.println(F(" mW"));
-      }
+      Serial.print(F("Temp Range: ")); Serial.print(minTemp, 1); 
+      Serial.print(F("°C to ")); Serial.print(maxTemp, 1); Serial.println(F("°C"));
     }
     
     // ALWAYS attempt to log to SD card, regardless of serial connection
@@ -682,7 +541,7 @@ void createCSVHeader() {
   Serial.println(F("Creating new log file with CSV header..."));
   File logFile = SD.open(LOG_FILENAME, FILE_WRITE);
   if (logFile) {
-    logFile.println("Date,Time,Lux,Latitude,Longitude,GPS_Fix,GPS_Sats,Solar_V,Solar_mA,Solar_mW,Solar_Temp,Battery_V,Battery_mA,Battery_mW,Battery_Temp,Load_V,Load_mA,Load_mW,Load_Temp");
+    logFile.println("ISO_Timestamp,Lux,Solar_V,Solar_mA,Solar_mW,Solar_Temp,Battery_V,Battery_mA,Battery_mW,Battery_Temp,Load_V,Load_mA,Load_mW,Load_Temp");
     logFile.flush(); // Ensure header is written immediately
     logFile.close();
     Serial.println(F("CSV header created successfully."));
@@ -711,13 +570,8 @@ void logDataToSD(const SensorData& data) {
   
   if (logFile) {
     // Write data to file
-    logFile.print(data.date_str); logFile.print(",");
-    logFile.print(data.time_str); logFile.print(",");
+    logFile.print(data.timestamp_iso); logFile.print(",");
     logFile.print(data.lux, 2); logFile.print(",");
-    logFile.print(data.latitude, 6); logFile.print(",");
-    logFile.print(data.longitude, 6); logFile.print(",");
-    logFile.print(data.gps_fix ? "1" : "0"); logFile.print(",");
-    logFile.print(data.gps_satellites); logFile.print(",");
     logFile.print(data.solar_voltage, 4); logFile.print(",");
     logFile.print(data.solar_current, 3); logFile.print(",");
     logFile.print(data.solar_power, 3); logFile.print(",");
@@ -764,9 +618,6 @@ SensorData readAllSensors() {
     data.lux = lightMeter.getLux();
   }
 
-  // Read GNSS data
-  readGNSSData(data);
-
   // Variables for raw register values (for debugging if needed)
   uint32_t rawVBus, shiftedVBus;
   int32_t rawVShunt, shiftedVShunt;
@@ -787,24 +638,27 @@ SensorData readAllSensors() {
   if (battery_current_lsb > 0.0f) {
     data.battery_voltage = readBusVoltage(INA_BATTERY_ADDR, rawVBus, shiftedVBus);
     float shuntV = readShuntVoltage(INA_BATTERY_ADDR, rawVShunt, shiftedVShunt);
+    float current_raw_from_chip = readCurrent(INA_BATTERY_ADDR, battery_current_lsb, rawCurrent, shiftedCurrent);
     
-    // Calculate current directly from shunt voltage and effective resistance
-    // This approach is more intuitive and eliminates the need for correction factors
-    // Current (mA) = Shunt Voltage (mV) / Effective Resistance (ohms)
-    data.battery_current = shuntV / EFFECTIVE_SHUNT_OHMS_BATTERY;
+    // Apply battery-specific correction factor
+    float current_final_battery = current_raw_from_chip * BATTERY_INA228_ANOMALY_FACTOR;
+    data.battery_current = current_final_battery; // Use corrected current
     
-    // Calculate power preserving sign convention: P = V × I
-    // Negative current (charging) will result in negative power
-    // Positive current (discharging) will result in positive power
-    data.battery_power = data.battery_voltage * data.battery_current;
+    // Calculate current from shunt voltage using effective resistance for comparison
+    float currentFromVshunt = (shuntV / 1000.0f) / EFFECTIVE_SHUNT_OHMS_BATTERY * 1000.0f;
     
+    data.battery_power = readPower(INA_BATTERY_ADDR, battery_current_lsb, rawPower);
     data.battery_temperature = readTemperature(INA_BATTERY_ADDR, rawTemp);
     
-    // Read chip values for comparison (debugging)
-    float current_from_chip = readCurrent(INA_BATTERY_ADDR, battery_current_lsb, rawCurrent, shiftedCurrent);
-    float power_from_chip = readPower(INA_BATTERY_ADDR, battery_current_lsb, rawPower);
-    
-    // Debug output removed for cleaner display
+    // Debug output every 5 seconds for battery monitoring
+    static unsigned long lastBatteryDebug = 0;
+    if (millis() - lastBatteryDebug > 5000) {
+    Serial.print(F("  Shunt Voltage: ")); Serial.print(shuntV, 4); Serial.println(F(" mV"));
+      Serial.print(F("  Current (from chip, scaled by LSB): ")); Serial.print(current_raw_from_chip, 4); Serial.println(F(" mA"));
+      Serial.print(F("  Current (Final Corrected): ")); Serial.print(current_final_battery, 4); Serial.println(F(" mA"));
+      Serial.print(F("  Calc. I from Vshunt (using R_eff): ")); Serial.print(currentFromVshunt, 4); Serial.println(F(" mA"));
+      lastBatteryDebug = millis();
+    }
   }
   
   // Read Load data
@@ -982,7 +836,15 @@ float readTemperature(uint8_t address, uint16_t& rawRegValue) {
   // Raw value of 0x1900 (6400 decimal) = ~50°C
   // Raw value of 0x1000 (4096 decimal) = ~32°C  
   
-  // Temperature debug output removed for cleaner display
+  // Debug output (only occasionally to avoid spam)
+  static unsigned long lastDebugTime = 0;
+  if (millis() - lastDebugTime > 10000) { // Every 10 seconds
+    Serial.print(F("DEBUG Temp (0x")); Serial.print(address, HEX); 
+    Serial.print(F("): Raw=0x")); Serial.print(rawRegValue, HEX);
+    Serial.print(F(" (")); Serial.print(rawRegValue); Serial.print(F(")"));
+    Serial.print(F(" -> ")); Serial.print((float)rawRegValue * 0.0078125f, 2); Serial.println(F("°C"));
+    lastDebugTime = millis();
+  }
   
   return (float)rawRegValue * 0.0078125f;
 }
@@ -1061,8 +923,8 @@ bool initRTC() {
 
   Serial.println(F("RTC online!"));
   
-  // Set default time zone to Central Daylight Time (CDT = UTC-5)
-  setTimeZone(true); // true = Daylight Time (CDT)
+  // Set default time zone to Central Standard Time (CST = UTC-6)
+  setTimeZone(false); // false = Standard Time (CST)
   
   // Check if this is the first time running or if RTC lost power
   if (rtc.getSeconds() == 0 && rtc.getMinutes() == 0 && rtc.getHours() == 0) {
@@ -1284,20 +1146,17 @@ void updateRTCTimestamp(SensorData& data) {
   
   if (rtc.updateTime() == false) {
     // If RTC update fails, use a fallback timestamp
-    strcpy(data.date_str, "RTC_ERROR");
-    strcpy(data.time_str, "RTC_ERROR");
+    strcpy(data.timestamp_iso, "RTC_ERROR");
     return;
   }
   
   // Create ISO 8601 formatted timestamp: YYYY-MM-DDTHH:MM:SS
   // Note: RV8803 library getYear() already returns 4-digit year (e.g., 2025)
-  snprintf(data.date_str, sizeof(data.date_str), 
-           "%04d-%02d-%02d",
+  snprintf(data.timestamp_iso, sizeof(data.timestamp_iso), 
+           "%04d-%02d-%02dT%02d:%02d:%02d",
            rtc.getYear(),      // Already 4-digit year, no need to add 2000
            rtc.getMonth(),
-           rtc.getDate());
-  snprintf(data.time_str, sizeof(data.time_str), 
-           "%02d:%02d:%02d",
+           rtc.getDate(),
            rtc.getHours(),
            rtc.getMinutes(),
            rtc.getSeconds());
@@ -1439,7 +1298,7 @@ void toggleTimeZone() {
 // Enhanced real-time display with multi-second adjustments
 void showEnhancedRealTimeDisplay() {
   Serial.println(F("=== Real-Time Display (Send commands or 'c' to continue) ==="));
-  Serial.println(F("Commands: +N (e.g., +10), -N (e.g., -5), z (timezone), d (debug), g (gnss sync), c (continue)"));
+  Serial.println(F("Commands: +N (e.g., +10), -N (e.g., -5), z (timezone), d (debug), c (continue)"));
   Serial.println(F("Auto-timeout in 30 seconds if no commands received..."));
   
   // Clear serial buffer before starting
@@ -1512,51 +1371,6 @@ void showEnhancedRealTimeDisplay() {
         serialDebugMode = !serialDebugMode;
         Serial.print(F("Serial debug mode: "));
         Serial.println(serialDebugMode ? F("ENABLED") : F("DISABLED"));
-        commandBuffer = ""; // Clear buffer
-      }
-      else if (command == 'g' || command == 'G') {
-        Serial.print(F("Manual GNSS time sync..."));
-        
-        // Enhanced GPS diagnostic information
-        SensorData tempData;
-        readGNSSData(tempData);
-        
-        Serial.println(); // New line for better formatting
-        Serial.print(F("GPS Status Check:"));
-        Serial.print(F(" Satellites: ")); Serial.print(tempData.gps_satellites);
-        Serial.print(F(", Fix: ")); Serial.print(tempData.gps_fix ? "YES" : "NO");
-        Serial.print(F(", isGNSSFixed: ")); Serial.print(isGNSSFixed ? "YES" : "NO");
-        
-        // Additional validation info
-        int numSats = myGNSS.getSIV();
-        float hdop = myGNSS.getHorizontalDOP() / 100.0;
-        bool gnssFixOk = myGNSS.getGnssFixOk();
-        bool validationOk = validateGnssData();
-        
-        Serial.println();
-        Serial.print(F("Validation Details:"));
-        Serial.print(F(" GNSS Fix OK: ")); Serial.print(gnssFixOk ? "YES" : "NO");
-        Serial.print(F(", Sats (min 4): ")); Serial.print(numSats);
-        Serial.print(F(", HDOP (max 5.0): ")); Serial.print(hdop, 2);
-        Serial.print(F(", Validation: ")); Serial.println(validationOk ? "PASS" : "FAIL");
-        
-        if (syncRTCWithGNSSLocal()) {
-          Serial.println(F("SUCCESS: RTC synced with GNSS time!"));
-          lastGnssTimeSync = millis();
-        } else {
-          Serial.println(F("FAILED: GPS sync not possible"));
-          if (!gnssFixOk) {
-            Serial.println(F("Reason: No GPS fix available"));
-          } else if (numSats < 4) {
-            Serial.println(F("Reason: Insufficient satellites (need ≥4)"));
-          } else if (hdop > 5.0) {
-            Serial.print(F("Reason: Poor GPS precision (HDOP=")); 
-            Serial.print(hdop, 2); Serial.println(F(" > 5.0)"));
-          } else {
-            Serial.println(F("Reason: Unknown validation failure"));
-          }
-          Serial.println(F("GPS modules may take 30-90 seconds for initial fix"));
-        }
         commandBuffer = ""; // Clear buffer
       }
       else if (command == '\r' || command == '\n') {
@@ -1687,195 +1501,4 @@ String readSerialCommand_String() {
   }
   
   return ""; // No complete command yet
-}
-
-// GNSS Functions Implementation
-bool initGNSS() {
-  Serial.println(F("Initializing GNSS module..."));
-  if (!myGNSS.begin()) {
-    Serial.println(F("GNSS not detected. Check wiring!"));
-    return false;
-  }
-  Serial.println(F("GNSS initialized successfully"));
-  
-  // Configure GNSS
-  myGNSS.setI2COutput(COM_TYPE_UBX);
-  
-  // Enable additional GNSS data for validation
-  myGNSS.setAutoNAVPVAT(true);      // Enable automatic NAVPVT messages
-  myGNSS.setAutoPVT(true);         // Enable navigation position velocity time solution
-  myGNSS.setAutoHPPOSLLH(true);    // Enable high precision geodetic position
-  
-  return true;
-}
-
-void readGNSSData(SensorData& data) {
-  // Initialize GPS data to defaults
-  data.latitude = 0.0;
-  data.longitude = 0.0;
-  data.gps_fix = false;
-  data.gps_satellites = 0;
-  
-  // Get fresh GNSS data
-  myGNSS.checkUblox();
-  
-  // Check if we have a valid GPS fix
-  if (myGNSS.getGnssFixOk() && validateGnssData()) {
-    isGNSSFixed = true;
-    data.gps_fix = true;
-    
-    // Convert from millionths of a degree to degrees
-    data.latitude = myGNSS.getLatitude() / 10000000.0;
-    data.longitude = myGNSS.getLongitude() / 10000000.0;
-    data.gps_satellites = myGNSS.getSIV();
-  } else {
-    isGNSSFixed = false;
-    data.gps_fix = false;
-    data.gps_satellites = myGNSS.getSIV(); // Still show satellite count even without fix
-  }
-}
-
-bool validateGnssData() {
-  // Minimum satellite count requirement
-  const int MIN_GNSS_SATS = 4;
-  const float GNSS_HDOP_THRESHOLD = 5.0;
-  
-  // Check for minimum satellite count
-  int numSatellites = myGNSS.getSIV();
-  if (numSatellites < MIN_GNSS_SATS) {
-    return false;
-  }
-  
-  // Check horizontal dilution of precision (HDOP)
-  // Lower values indicate better precision
-  float hdop = myGNSS.getHorizontalDOP() / 100.0; // HDOP is reported in cm
-  if (hdop > GNSS_HDOP_THRESHOLD) {
-    return false;
-  }
-  
-  return true;
-}
-
-// GNSS Time Synchronization Functions
-bool syncRTCWithGNSS() {
-  // Sync RTC with GNSS UTC time (no timezone adjustment)
-  if (!isGNSSFixed || !validateGnssData()) {
-    return false;
-  }
-  
-  // Get time from GNSS
-  uint8_t hour = myGNSS.getHour();
-  uint8_t minute = myGNSS.getMinute();
-  uint8_t second = myGNSS.getSecond();
-  uint8_t day = myGNSS.getDay();
-  uint8_t month = myGNSS.getMonth();
-  uint16_t year = myGNSS.getYear();
-  
-  // Set RTC time
-  bool result = rtc.setTime(second, minute, hour, 1, day, month, year); // 1 = Sunday (placeholder)
-  
-  if (result) {
-    Serial.print(F("RTC synced to GNSS UTC: "));
-    Serial.print(year); Serial.print(F("/"));
-    Serial.print(month); Serial.print(F("/"));
-    Serial.print(day); Serial.print(F(" "));
-    Serial.print(hour); Serial.print(F(":"));
-    Serial.print(minute); Serial.print(F(":"));
-    Serial.println(second);
-  }
-  
-  return result;
-}
-
-bool syncRTCWithGNSSLocal() {
-  // Sync RTC with GNSS time adjusted to local timezone (CST/CDT)
-  if (!isGNSSFixed || !validateGnssData()) {
-    return false;
-  }
-  
-  // Get time from GNSS (UTC)
-  uint8_t hour = myGNSS.getHour();
-  uint8_t minute = myGNSS.getMinute(); 
-  uint8_t second = myGNSS.getSecond();
-  uint8_t day = myGNSS.getDay();
-  uint8_t month = myGNSS.getMonth();
-  uint16_t year = myGNSS.getYear();
-  
-  // Apply timezone offset
-  // currentTimeZone is in quarter hours, so divide by 4 to get hours
-  int8_t timezoneHours = currentTimeZone / 4;
-  
-  // Convert to minutes for calculation
-  int totalMinutes = hour * 60 + minute + (timezoneHours * 60);
-  
-  // Handle day rollover
-  if (totalMinutes < 0) {
-    totalMinutes += 24 * 60; // Add 24 hours
-    day--; // Previous day
-    if (day == 0) {
-      // Handle month rollover
-      month--;
-      if (month == 0) {
-        month = 12;
-        year--;
-      }
-      // Set to last day of previous month (simplified)
-      day = 31; // Will be corrected by RTC library
-    }
-  } else if (totalMinutes >= 24 * 60) {
-    totalMinutes -= 24 * 60; // Subtract 24 hours
-    day++; // Next day
-    if (day > 31) { // Simplified day check
-      day = 1;
-      month++;
-      if (month > 12) {
-        month = 1;
-        year++;
-      }
-    }
-  }
-  
-  // Convert back to hours and minutes
-  hour = totalMinutes / 60;
-  minute = totalMinutes % 60;
-  
-  // Set RTC time with local timezone adjustment
-  bool result = rtc.setTime(second, minute, hour, 1, day, month, year); // 1 = Sunday (placeholder)
-  
-  if (result) {
-    Serial.print(F("RTC synced to GNSS Local Time ("));
-    if (currentTimeZone == -24) {
-      Serial.print(F("CST"));
-    } else if (currentTimeZone == -20) {
-      Serial.print(F("CDT"));
-    } else {
-      Serial.print(F("UTC"));
-      Serial.print(timezoneHours >= 0 ? "+" : "");
-      Serial.print(timezoneHours);
-    }
-    Serial.print(F("): "));
-    Serial.print(year); Serial.print(F("/"));
-    Serial.print(month); Serial.print(F("/"));
-    Serial.print(day); Serial.print(F(" "));
-    if (hour < 10) Serial.print(F("0"));
-    Serial.print(hour); Serial.print(F(":"));
-    if (minute < 10) Serial.print(F("0"));
-    Serial.print(minute); Serial.print(F(":"));
-    if (second < 10) Serial.print(F("0"));
-    Serial.println(second);
-  }
-  
-  return result;
-}
-
-void checkPeriodicGNSSTimeSync() {
-  Serial.print(F("Performing periodic GNSS time sync..."));
-  
-  if (syncRTCWithGNSSLocal()) {
-    Serial.println(F(" Success!"));
-    lastGnssTimeSync = millis();
-  } else {
-    Serial.println(F(" Failed (no GPS fix)"));
-    // Don't update lastGnssTimeSync on failure - will retry next interval
-  }
 }
