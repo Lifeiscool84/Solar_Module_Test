@@ -78,8 +78,10 @@ bool Adafruit_I2CDevice::detected(void) {
 #endif
 
 // Fix for Apollo3 architecture - use (uint8_t) cast to resolve ambiguity
-#ifdef ARDUINO_ARCH_MBED
+#if defined(ARDUINO_ARCH_MBED) || defined(APOLLO3) || defined(apollo3blue)
   _wire->write((uint8_t)0); // Cast to uint8_t to avoid ambiguity
+#else
+  _wire->write(0); // Standard write call for other platforms
 #endif
 
   if (_wire->endTransmission() == 0) {
