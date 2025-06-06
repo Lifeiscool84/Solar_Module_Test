@@ -9,6 +9,9 @@
 #include <SPI.h>
 #include <SdFat.h>
 
+// Debug Configuration - Set to false for battery operation
+const bool ENABLE_SERIAL_DEBUG = true;  // Change to false for standalone operation
+
 // Hardware Configuration
 const uint8_t SD_CS_PIN = 8;
 const uint8_t INA228_I2C_ADDRESS = 0x44;
@@ -112,18 +115,22 @@ uint32_t ina228_readRegister24(uint8_t reg) {
 }
 
 bool initializeINA228() {
-    Serial.print(F("Initializing INA228... "));
+    if (ENABLE_SERIAL_DEBUG) Serial.print(F("Initializing INA228... "));
     
     // First check if device is present by reading Device ID
     uint16_t deviceID = ina228_readRegister16(INA228_REG_DEVICEID);
-    Serial.print(F("Device ID: 0x"));
-    Serial.print(deviceID, HEX);
-    Serial.print(F(" "));
+    if (ENABLE_SERIAL_DEBUG) {
+        Serial.print(F("Device ID: 0x"));
+        Serial.print(deviceID, HEX);
+        Serial.print(F(" "));
+    }
     
     // INA228 should return 0x2280 or 0x2281 (TI forum confirms both exist)
     if (deviceID != 0x2280 && deviceID != 0x2281) {
-        Serial.print(F("Failed! Expected 0x2280 or 0x2281, got 0x"));
-        Serial.println(deviceID, HEX);
+        if (ENABLE_SERIAL_DEBUG) {
+            Serial.print(F("Failed! Expected 0x2280 or 0x2281, got 0x"));
+            Serial.println(deviceID, HEX);
+        }
         return false;
     }
     
@@ -136,7 +143,7 @@ bool initializeINA228() {
     // Bit 15-14: MODE=11 (continuous shunt and bus)
     uint16_t config = 0x4000 | (0x4 << 6) | (0x4 << 3) | 0x03;  // 0x4233
     if (!ina228_writeRegister16(INA228_REG_CONFIG, config)) {
-        Serial.println(F("Failed to set configuration!"));
+        if (ENABLE_SERIAL_DEBUG) Serial.println(F("Failed to set configuration!"));
         return false;
     }
     
@@ -145,19 +152,21 @@ bool initializeINA228() {
     float shuntCal_f = 13107.2e6 * CURRENT_LSB * RSHUNT_OHMS;
     uint16_t shuntCal = (uint16_t)(shuntCal_f + 0.5);  // Round to nearest integer
     
-    Serial.print(F("SHUNT_CAL: "));
-    Serial.print(shuntCal);
-    Serial.print(F(" "));
+    if (ENABLE_SERIAL_DEBUG) {
+        Serial.print(F("SHUNT_CAL: "));
+        Serial.print(shuntCal);
+        Serial.print(F(" "));
+    }
     
     if (!ina228_writeRegister16(INA228_REG_SHUNTCAL, shuntCal)) {
-        Serial.println(F("Failed to set shunt calibration!"));
+        if (ENABLE_SERIAL_DEBUG) Serial.println(F("Failed to set shunt calibration!"));
         return false;
     }
     
     // Give device time to start conversions
     delay(10);
     
-    Serial.println(F("Success!"));
+    if (ENABLE_SERIAL_DEBUG) Serial.println(F("Success!"));
     return true;
 }
 
@@ -460,46 +469,56 @@ void runTest_Periodic_Batch_Write_Cycle() {
 
 // Main Arduino Functions
 void setup() {
-    Serial.begin(115200);
-    delay(2000);
+    if (ENABLE_SERIAL_DEBUG) {
+        Serial.begin(115200);
+        delay(2000);
+        
+        Serial.println(F("\n=========================================================="));
+        Serial.println(F("    SD CARD POWER CONSUMPTION TEST - ESSENTIAL STATES"));
+        Serial.println(F("=========================================================="));
+        Serial.println();
+        Serial.println(F("Purpose: Measure power consumption across four essential"));
+        Serial.println(F("         SD card operational states with precise timing"));
+        Serial.println();
+        
+        Serial.println(F("--- CONFIGURATION SUMMARY ---"));
+    }
     
-    Serial.println(F("\n=========================================================="));
-    Serial.println(F("    SD CARD POWER CONSUMPTION TEST - ESSENTIAL STATES"));
-    Serial.println(F("=========================================================="));
-    Serial.println();
-    Serial.println(F("Purpose: Measure power consumption across four essential"));
-    Serial.println(F("         SD card operational states with precise timing"));
-    Serial.println();
-    
-    Serial.println(F("--- CONFIGURATION SUMMARY ---"));
     testRunID = millis();
-    Serial.print(F("Test Run ID: "));
-    Serial.println(testRunID);
-    Serial.print(F("Test State Duration:    "));
-    Serial.print(TEST_STATE_DURATION_S);
-    Serial.println(F(" seconds"));
-    Serial.print(F("Sampling Interval:      "));
-    Serial.print(SENSOR_SAMPLING_INTERVAL_MS);
-    Serial.print(F(" ms ("));
-    Serial.print(1000.0 / SENSOR_SAMPLING_INTERVAL_MS);
-    Serial.println(F(" Hz)"));
-    Serial.print(F("RAM Buffer Size:        "));
-    Serial.print(RAM_BUFFER_SIZE);
-    Serial.println(F(" samples"));
-    Serial.print(F("SD Card CS Pin:         "));
-    Serial.println(SD_CS_PIN);
-    Serial.print(F("CSV Filename:           "));
-    Serial.println(CSV_FILENAME);
-    Serial.println();
+    
+    if (ENABLE_SERIAL_DEBUG) {
+        Serial.print(F("Test Run ID: "));
+        Serial.println(testRunID);
+        Serial.print(F("Test State Duration:    "));
+        Serial.print(TEST_STATE_DURATION_S);
+        Serial.println(F(" seconds"));
+        Serial.print(F("Sampling Interval:      "));
+        Serial.print(SENSOR_SAMPLING_INTERVAL_MS);
+        Serial.print(F(" ms ("));
+        Serial.print(1000.0 / SENSOR_SAMPLING_INTERVAL_MS);
+        Serial.println(F(" Hz)"));
+        Serial.print(F("RAM Buffer Size:        "));
+        Serial.print(RAM_BUFFER_SIZE);
+        Serial.println(F(" samples"));
+        Serial.print(F("SD Card CS Pin:         "));
+        Serial.println(SD_CS_PIN);
+        Serial.print(F("CSV Filename:           "));
+        Serial.println(CSV_FILENAME);
+        Serial.println();
+    }
     
     if (!initializeTestEnvironment()) {
-        Serial.println(F("FATAL ERROR: Failed to initialize test environment!"));
-        Serial.println(F("Check hardware connections and reset system."));
+        if (ENABLE_SERIAL_DEBUG) {
+            Serial.println(F("FATAL ERROR: Failed to initialize test environment!"));
+            Serial.println(F("Check hardware connections and reset system."));
+        }
         while (1) delay(1000);
     }
     
-    Serial.println(F("=== SD Card Power Test Essentials ==="));
-    Serial.println(F("Starting essential power consumption testing..."));
+    if (ENABLE_SERIAL_DEBUG) {
+        Serial.println(F("=== SD Card Power Test Essentials ==="));
+        Serial.println(F("Starting essential power consumption testing..."));
+    }
 }
 
 void loop() {
