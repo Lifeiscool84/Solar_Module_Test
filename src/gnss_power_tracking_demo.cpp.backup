@@ -1,0 +1,576 @@
+/**
+ * @file gnss_power_tracking_demo.cpp
+ * @brief Comprehensive GNSS Power Tracking Demonstration
+ * 
+ * Integrates professional drivers from Croc_Tracker_Dev_ref to demonstrate:
+ * - GNSS position tracking with power consumption monitoring
+ * - Coordinated RTC/GNSS time synchronization via TimeManager
+ * - Professional multi-sensor data logging to SD card
+ * - Real-time power analysis during GNSS operations
+ * 
+ * Hardware Required:
+ * - SparkFun RedBoard Artemis Nano
+ * - RV8803 RTC module (I2C)
+ * - u-blox GNSS module (I2C) 
+ * - 2x INA228 power sensors (Battery: 0x44, Load: 0x41)
+ * - SD card module
+ * - Clear sky view for GNSS reception
+ * 
+ * @author Senior Embedded Systems Engineer
+ * @date January 2025
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SdFat.h>
+
+// Professional driver includes from Croc_Tracker_Dev_ref
+#include "../Croc_Tracker_Dev_ref/hardware/sensors/rtc/rv8803_driver.h"
+#include "../Croc_Tracker_Dev_ref/hardware/sensors/gnss/ublox_driver.h"
+#include "../Croc_Tracker_Dev_ref/firmware/reference_implementations/time_manager.h"
+
+// Hardware Configuration
+const uint8_t SD_CS_PIN = 8;
+const uint8_t INA228_SOLAR_ADDRESS = 0x40;    // Solar panel sensor
+const uint8_t INA228_BATTERY_ADDRESS = 0x44;  // Battery sensor
+const uint8_t INA228_LOAD_ADDRESS = 0x41;     // Load sensor (after regulator)
+
+// INA228 Register Addresses
+const uint8_t INA228_REG_CONFIG = 0x00;
+const uint8_t INA228_REG_VBUS = 0x05;
+const uint8_t INA228_REG_CURRENT = 0x07;
+const uint8_t INA228_REG_POWER = 0x08;
+const uint8_t INA228_REG_SHUNTCAL = 0x02;
+const uint8_t INA228_REG_DEVICEID = 0x3F;
+
+// Power monitoring configuration
+const float RSHUNT_OHMS = 0.0177186;           // Effective shunt resistance
+const float MAX_CURRENT_A = 5.0;               // Maximum expected current
+const float CURRENT_LSB = MAX_CURRENT_A / 524288.0;  // 19-bit resolution
+
+// Demo Configuration
+const uint32_t GNSS_SAMPLE_INTERVAL_MS = 5000;    // GNSS reading every 5 seconds
+const uint32_t POWER_SAMPLE_INTERVAL_MS = 1000;   // Power monitoring every 1 second
+const uint32_t STATUS_REPORT_INTERVAL_MS = 30000; // Status report every 30 seconds
+const uint32_t DEMO_DURATION_MINUTES = 30;        // Total demo duration
+const char CSV_FILENAME[] = "gnss_power_demo.csv";
+
+// Professional Data Structure for Integrated Tracking
+struct GNSSPowerLogEntry {
+    // Timestamp information
+    RTCTimestamp rtc_timestamp;        // RTC-based timestamp
+    uint32_t system_millis;            // System millis for correlation
+    
+    // GNSS data
+    GNSSData gnss_data;                // Complete GNSS information
+    bool gnss_reading_valid;           // GNSS data validity
+    
+    // Power monitoring - Solar sensor
+    float solar_voltage_V;
+    float solar_current_mA;
+    float solar_power_mW;
+    
+    // Power monitoring - Battery sensor
+    float battery_voltage_V;
+    float battery_current_mA;
+    float battery_power_mW;
+    
+    // Power monitoring - Load sensor  
+    float load_voltage_V;
+    float load_current_mA;
+    float load_power_mW;
+    
+    // Calculated power consumption
+    float gnss_power_consumption_mW;   // Estimated GNSS power usage
+    float system_efficiency_percent;    // Load/Battery power ratio
+};
+
+// Global Objects - Professional Driver Instances
+RV8803_Driver rtc_driver;
+UBLOX_Driver gnss_driver; 
+TimeManager time_manager;
+SdFat SD;
+
+// Demo State Management
+bool demo_active = true;
+bool gnss_initialization_successful = false;
+uint32_t demo_start_time = 0;
+uint32_t last_gnss_sample = 0;
+uint32_t last_power_sample = 0;
+uint32_t last_status_report = 0;
+uint32_t total_gnss_readings = 0;
+uint32_t successful_gnss_fixes = 0;
+
+// Power Monitoring Functions (Enhanced from sd_power_test_essentials.cpp)
+bool ina228_writeRegister16(uint8_t address, uint8_t reg, uint16_t value) {
+    Wire.beginTransmission(address);
+    Wire.write(reg);
+    Wire.write((value >> 8) & 0xFF);
+    Wire.write(value & 0xFF);
+    return (Wire.endTransmission() == 0);
+}
+
+uint32_t ina228_readRegister24(uint8_t address, uint8_t reg) {
+    Wire.beginTransmission(address);
+    Wire.write(reg);
+    if (Wire.endTransmission() != 0) return 0;
+    
+    Wire.requestFrom(address, (uint8_t)3);
+    if (Wire.available() >= 3) {
+        uint32_t value = ((uint32_t)Wire.read() << 16) | 
+                         ((uint32_t)Wire.read() << 8) | 
+                         (uint32_t)Wire.read();
+        return value;
+    }
+    return 0;
+}
+
+bool initializeINA228(uint8_t address, const char* sensor_name) {
+    Serial.print(F("Initializing INA228 "));
+    Serial.print(sensor_name);
+    Serial.print(F(" (0x"));
+    Serial.print(address, HEX);
+    Serial.print(F(")... "));
+    
+    // Check device ID
+    uint16_t deviceID = ina228_readRegister16(address, INA228_REG_DEVICEID);
+    if (deviceID != 0x2280 && deviceID != 0x2281) {
+        Serial.println(F("FAILED!"));
+        return false;
+    }
+    
+    // Configure for continuous measurement
+    uint16_t config = 0x4000 | (0x4 << 6) | (0x4 << 3) | 0x03;
+    if (!ina228_writeRegister16(address, INA228_REG_CONFIG, config)) {
+        Serial.println(F("Configuration failed!"));
+        return false;
+    }
+    
+    // Set shunt calibration
+    float shuntCal_f = 13107.2e6 * CURRENT_LSB * RSHUNT_OHMS;
+    uint16_t shuntCal = (uint16_t)(shuntCal_f + 0.5);
+    if (!ina228_writeRegister16(address, INA228_REG_SHUNTCAL, shuntCal)) {
+        Serial.println(F("Calibration failed!"));
+        return false;
+    }
+    
+    Serial.println(F("Success!"));
+    return true;
+}
+
+uint16_t ina228_readRegister16(uint8_t address, uint8_t reg) {
+    Wire.beginTransmission(address);
+    Wire.write(reg);
+    if (Wire.endTransmission() != 0) return 0;
+    
+    Wire.requestFrom(address, (uint8_t)2);
+    if (Wire.available() >= 2) {
+        return ((uint16_t)Wire.read() << 8) | Wire.read();
+    }
+    return 0;
+}
+
+float ina228_readBusVoltage(uint8_t address) {
+    uint32_t raw = ina228_readRegister24(address, INA228_REG_VBUS);
+    return (float)((raw >> 4) * 195.3125e-6);  // Convert to volts
+}
+
+float ina228_readCurrent(uint8_t address) {
+    uint32_t raw = ina228_readRegister24(address, INA228_REG_CURRENT);
+    int32_t signed_raw = (int32_t)raw;
+    
+    if (signed_raw & 0x800000) {
+        signed_raw |= 0xFF000000;  // Sign extend
+    }
+    signed_raw >>= 4;
+    
+    return (float)(signed_raw * CURRENT_LSB * 1000.0);  // Convert to mA
+}
+
+float ina228_readPower(uint8_t address) {
+    uint32_t raw = ina228_readRegister24(address, INA228_REG_POWER);
+    float powerLSB = 3.2 * CURRENT_LSB;
+    return (float)(raw * powerLSB * 1000.0);  // Convert to mW
+}
+
+// Professional Data Logging with CSV Format
+bool initializeCSVLogging() {
+    File32 logFile = SD.open(CSV_FILENAME, O_WRONLY | O_CREAT | O_APPEND);
+    if (!logFile) {
+        Serial.println(F("ERROR: Could not create CSV file"));
+        return false;
+    }
+    
+    if (logFile.size() == 0) {
+        // Write comprehensive CSV header
+        logFile.println(F("Timestamp_ISO8601,System_Millis_ms,GNSS_Valid,Latitude_deg,Longitude_deg,Altitude_m,Satellites_Used,HDOP,Fix_Type,Solar_Voltage_V,Solar_Current_mA,Solar_Power_mW,Battery_Voltage_V,Battery_Current_mA,Battery_Power_mW,Load_Voltage_V,Load_Current_mA,Load_Power_mW,GNSS_Power_Est_mW,System_Efficiency_pct"));
+        Serial.println(F("CSV header written successfully"));
+    }
+    
+    logFile.close();
+    return true;
+}
+
+bool logGNSSPowerEntry(const GNSSPowerLogEntry& entry) {
+    File32 logFile = SD.open(CSV_FILENAME, O_WRONLY | O_APPEND);
+    if (!logFile) return false;
+    
+    // ISO8601 timestamp
+    logFile.print(entry.rtc_timestamp.iso8601_string);
+    logFile.print(",");
+    
+    // System millis
+    logFile.print(entry.system_millis);
+    logFile.print(",");
+    
+    // GNSS data
+    logFile.print(entry.gnss_reading_valid ? 1 : 0);
+    logFile.print(",");
+    if (entry.gnss_reading_valid) {
+        logFile.print(entry.gnss_data.position.latitude_deg, 7);
+        logFile.print(",");
+        logFile.print(entry.gnss_data.position.longitude_deg, 7);
+        logFile.print(",");
+        logFile.print(entry.gnss_data.position.altitude_m, 2);
+        logFile.print(",");
+        logFile.print(entry.gnss_data.satellites_used);
+        logFile.print(",");
+        logFile.print(entry.gnss_data.hdop, 2);
+        logFile.print(",");
+        logFile.print((int)entry.gnss_data.fix_type);
+    } else {
+        logFile.print("0,0,0,0,0,0");  // Placeholder values
+    }
+    logFile.print(",");
+    
+    // Solar power data
+    logFile.print(entry.solar_voltage_V, 4);
+    logFile.print(",");
+    logFile.print(entry.solar_current_mA, 2);
+    logFile.print(",");
+    logFile.print(entry.solar_power_mW, 2);
+    logFile.print(",");
+    
+    // Battery power data
+    logFile.print(entry.battery_voltage_V, 4);
+    logFile.print(",");
+    logFile.print(entry.battery_current_mA, 2);
+    logFile.print(",");
+    logFile.print(entry.battery_power_mW, 2);
+    logFile.print(",");
+    logFile.print(entry.load_voltage_V, 4);
+    logFile.print(",");
+    logFile.print(entry.load_current_mA, 2);
+    logFile.print(",");
+    logFile.print(entry.load_power_mW, 2);
+    logFile.print(",");
+    logFile.print(entry.gnss_power_consumption_mW, 2);
+    logFile.print(",");
+    logFile.print(entry.system_efficiency_percent, 1);
+    logFile.println();
+    
+    logFile.close();
+    return true;
+}
+
+// Professional System Initialization
+bool initializeSystem() {
+    Serial.println(F("\n======================================================="));
+    Serial.println(F("    GNSS POWER TRACKING DEMONSTRATION"));
+    Serial.println(F("    Professional Multi-Sensor Integration"));
+    Serial.println(F("======================================================="));
+    
+    // Initialize I2C
+    Serial.print(F("Initializing I2C bus... "));
+    Wire.begin();
+    Serial.println(F("Success!"));
+    
+    // Initialize RTC driver
+    Serial.println(F("\n=== RTC Driver Initialization ==="));
+    RTCStatus rtc_status = rtc_driver.initialize();
+    if (rtc_status != RTCStatus::SUCCESS) {
+        Serial.print(F("FATAL ERROR: RTC initialization failed: "));
+        Serial.println((int)rtc_status);
+        return false;
+    }
+    Serial.println(F("RTC driver initialized successfully"));
+    rtc_driver.printStatus();
+    
+    // Initialize GNSS driver
+    Serial.println(F("\n=== GNSS Driver Initialization ==="));
+    GNSSStatus gnss_status = gnss_driver.initialize();
+    if (gnss_status != GNSSStatus::SUCCESS) {
+        Serial.print(F("WARNING: GNSS initialization failed: "));
+        Serial.println((int)gnss_status);
+        Serial.println(F("Demo will continue with power monitoring only"));
+        gnss_initialization_successful = false;
+    } else {
+        Serial.println(F("GNSS driver initialized successfully"));
+        gnss_initialization_successful = true;
+    }
+    
+    // Initialize TimeManager for coordinated time sync
+    Serial.println(F("\n=== TimeManager Service Initialization ==="));
+    TimeManagerConfig tm_config;
+    tm_config.sync_interval_ms = 10UL * 60UL * 1000UL;  // 10 minutes for demo
+    tm_config.enable_automatic_sync = true;
+    tm_config.fallback_to_rtc = true;
+    
+    TimeManager time_manager_instance(tm_config);
+    time_manager = time_manager_instance;
+    
+    TimeManagerStatus tm_status = time_manager.initialize(rtc_driver, gnss_driver);
+    if (tm_status != TimeManagerStatus::SUCCESS) {
+        Serial.print(F("WARNING: TimeManager initialization failed: "));
+        Serial.println(TimeManager::getStatusString(tm_status));
+    } else {
+        Serial.println(F("TimeManager service ready"));
+    }
+    
+    // Initialize power sensors
+    Serial.println(F("\n=== Power Monitoring Initialization ==="));
+    if (!initializeINA228(INA228_SOLAR_ADDRESS, "Solar")) return false;
+    if (!initializeINA228(INA228_BATTERY_ADDRESS, "Battery")) return false;
+    if (!initializeINA228(INA228_LOAD_ADDRESS, "Load")) return false;
+    
+    // Initialize SD card
+    Serial.println(F("\n=== SD Card Initialization ==="));
+    if (!SD.begin(SD_CS_PIN)) {
+        Serial.println(F("FATAL ERROR: SD card initialization failed"));
+        return false;
+    }
+    Serial.println(F("SD card initialized successfully"));
+    
+    if (!initializeCSVLogging()) {
+        Serial.println(F("FATAL ERROR: CSV logging initialization failed"));
+        return false;
+    }
+    
+    Serial.println(F("\n=== System Initialization Complete ==="));
+    return true;
+}
+
+// Core Data Collection Function
+void collectIntegratedData() {
+    static float baseline_power_mW = 0;
+    static bool baseline_established = false;
+    
+    GNSSPowerLogEntry entry;
+    entry.system_millis = millis();
+    
+    // Get timestamped data from RTC/TimeManager
+    if (!time_manager.getCurrentTime(entry.rtc_timestamp)) {
+        // Fallback to RTC direct read
+        rtc_driver.getTimestamp(entry.rtc_timestamp);
+    }
+    
+    // Collect solar power data
+    entry.solar_voltage_V = ina228_readBusVoltage(INA228_SOLAR_ADDRESS);
+    entry.solar_current_mA = ina228_readCurrent(INA228_SOLAR_ADDRESS);
+    entry.solar_power_mW = ina228_readPower(INA228_SOLAR_ADDRESS);
+    
+    // Collect battery power data
+    entry.battery_voltage_V = ina228_readBusVoltage(INA228_BATTERY_ADDRESS);
+    entry.battery_current_mA = ina228_readCurrent(INA228_BATTERY_ADDRESS);
+    entry.battery_power_mW = ina228_readPower(INA228_BATTERY_ADDRESS);
+    
+    entry.load_voltage_V = ina228_readBusVoltage(INA228_LOAD_ADDRESS);
+    entry.load_current_mA = ina228_readCurrent(INA228_LOAD_ADDRESS);
+    entry.load_power_mW = ina228_readPower(INA228_LOAD_ADDRESS);
+    
+    // Calculate system efficiency (Solar to Load efficiency)
+    if (entry.solar_power_mW > 0) {
+        entry.system_efficiency_percent = (entry.load_power_mW / entry.solar_power_mW) * 100.0f;
+    } else {
+        entry.system_efficiency_percent = 0;
+    }
+    
+    // Collect GNSS data if available
+    uint32_t current_time = millis();
+    if (gnss_initialization_successful && (current_time - last_gnss_sample >= GNSS_SAMPLE_INTERVAL_MS)) {
+        entry.gnss_reading_valid = gnss_driver.readPosition(entry.gnss_data);
+        
+        if (entry.gnss_reading_valid) {
+            total_gnss_readings++;
+            if (entry.gnss_data.validation_passed) {
+                successful_gnss_fixes++;
+            }
+        }
+        
+        last_gnss_sample = current_time;
+        
+        // Estimate GNSS power consumption (difference from baseline)
+        if (!baseline_established && !entry.gnss_reading_valid) {
+            baseline_power_mW = entry.load_power_mW;
+            baseline_established = true;
+        }
+        
+        if (baseline_established) {
+            entry.gnss_power_consumption_mW = entry.load_power_mW - baseline_power_mW;
+            if (entry.gnss_power_consumption_mW < 0) entry.gnss_power_consumption_mW = 0;
+        }
+    } else {
+        entry.gnss_reading_valid = false;
+        entry.gnss_power_consumption_mW = 0;
+    }
+    
+    // Log data to SD card
+    if (!logGNSSPowerEntry(entry)) {
+        Serial.println(F("WARNING: Failed to log data"));
+    }
+    
+    // Periodic sync check via TimeManager
+    time_manager.periodicSync();
+}
+
+// Status Reporting Function
+void printStatusReport() {
+    Serial.println(F("\n=== GNSS Power Tracking Status Report ==="));
+    
+    // System uptime
+    uint32_t uptime_minutes = (millis() - demo_start_time) / 60000;
+    Serial.print(F("Demo Runtime: "));
+    Serial.print(uptime_minutes);
+    Serial.println(F(" minutes"));
+    
+    // Current timestamp
+    RTCTimestamp current_time;
+    if (time_manager.getCurrentTime(current_time)) {
+        Serial.print(F("Current Time: "));
+        Serial.println(current_time.iso8601_string);
+    }
+    
+    // GNSS performance
+    if (gnss_initialization_successful) {
+        float fix_success_rate = 0;
+        if (total_gnss_readings > 0) {
+            fix_success_rate = (float)successful_gnss_fixes / total_gnss_readings * 100.0f;
+        }
+        
+        Serial.print(F("GNSS Fix Success Rate: "));
+        Serial.print(fix_success_rate, 1);
+        Serial.print(F("% ("));
+        Serial.print(successful_gnss_fixes);
+        Serial.print(F("/"));
+        Serial.print(total_gnss_readings);
+        Serial.println(F(")"));
+        
+        // Current GNSS status
+        if (gnss_driver.hasValidFix()) {
+            uint8_t sats_used, sats_visible;
+            float hdop;
+            if (gnss_driver.getSatelliteInfo(sats_used, sats_visible, hdop)) {
+                Serial.print(F("Current Fix: "));
+                Serial.print(sats_used);
+                Serial.print(F(" satellites, HDOP: "));
+                Serial.println(hdop, 2);
+            }
+        } else {
+            Serial.println(F("GNSS Status: No current fix"));
+        }
+    } else {
+        Serial.println(F("GNSS Status: Not available"));
+    }
+    
+    // Power consumption summary
+    float current_solar_power = ina228_readPower(INA228_SOLAR_ADDRESS);
+    float current_battery_power = ina228_readPower(INA228_BATTERY_ADDRESS);
+    float current_load_power = ina228_readPower(INA228_LOAD_ADDRESS);
+    
+    Serial.print(F("Current Power: Solar "));
+    Serial.print(current_solar_power, 2);
+    Serial.print(F("mW, Battery "));
+    Serial.print(current_battery_power, 2);
+    Serial.print(F("mW, Load "));
+    Serial.print(current_load_power, 2);
+    Serial.println(F("mW"));
+    
+    // TimeManager status
+    const TimeSyncStats& sync_stats = time_manager.getStatistics();
+    Serial.print(F("Time Sync: "));
+    Serial.print(sync_stats.successful_syncs);
+    Serial.print(F(" successful, "));
+    Serial.print(sync_stats.failed_syncs);
+    Serial.println(F(" failed"));
+    
+    Serial.println(F("=========================================="));
+}
+
+// Arduino Setup Function
+void setup() {
+    Serial.begin(115200);
+    delay(2000);
+    
+    // Initialize complete system
+    if (!initializeSystem()) {
+        Serial.println(F("FATAL ERROR: System initialization failed"));
+        Serial.println(F("Check hardware connections and restart"));
+        while (1) delay(1000);
+    }
+    
+    // Record demo start time
+    demo_start_time = millis();
+    
+    Serial.println(F("\n=== Starting GNSS Power Tracking Demo ==="));
+    Serial.print(F("Demo Duration: "));
+    Serial.print(DEMO_DURATION_MINUTES);
+    Serial.println(F(" minutes"));
+    Serial.print(F("GNSS Sampling: Every "));
+    Serial.print(GNSS_SAMPLE_INTERVAL_MS / 1000);
+    Serial.println(F(" seconds"));
+    Serial.print(F("Power Sampling: Every "));
+    Serial.print(POWER_SAMPLE_INTERVAL_MS / 1000);
+    Serial.println(F(" seconds"));
+    Serial.print(F("Data Logging: "));
+    Serial.println(CSV_FILENAME);
+    
+    if (gnss_initialization_successful) {
+        Serial.println(F("\nWaiting for GNSS fix... (may take up to 90 seconds)"));
+    }
+    
+    Serial.println(F("Press 's' for status, 'q' to quit demo"));
+    Serial.println(F("=============================================="));
+}
+
+// Arduino Main Loop
+void loop() {
+    uint32_t current_time = millis();
+    
+    // Check for demo timeout
+    if ((current_time - demo_start_time) > (DEMO_DURATION_MINUTES * 60UL * 1000UL)) {
+        demo_active = false;
+    }
+    
+    if (!demo_active) {
+        Serial.println(F("\n=== Demo Complete ==="));
+        Serial.print(F("Data logged to: "));
+        Serial.println(CSV_FILENAME);
+        Serial.println(F("System will halt. Reset to run again."));
+        while (1) delay(1000);
+    }
+    
+    // Handle serial commands
+    if (Serial.available()) {
+        char command = Serial.read();
+        if (command == 's' || command == 'S') {
+            printStatusReport();
+        } else if (command == 'q' || command == 'Q') {
+            demo_active = false;
+        }
+    }
+    
+    // Collect integrated sensor data
+    if (current_time - last_power_sample >= POWER_SAMPLE_INTERVAL_MS) {
+        collectIntegratedData();
+        last_power_sample = current_time;
+    }
+    
+    // Periodic status reports
+    if (current_time - last_status_report >= STATUS_REPORT_INTERVAL_MS) {
+        printStatusReport();
+        last_status_report = current_time;
+    }
+    
+    delay(100);  // Prevent excessive CPU usage
+} 

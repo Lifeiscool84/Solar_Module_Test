@@ -122,7 +122,21 @@ def clean_and_load_data(file_path):
         df[col] = pd.to_numeric(df[col], errors='coerce')
     
     # Remove rows with invalid power data
-    df.dropna(subset=['Batt_Power_mW'], inplace=True)
+    # Support both old and new CSV formats
+    if 'Battery_Power_mW' in df.columns:
+        df.dropna(subset=['Battery_Power_mW'], inplace=True)
+    elif 'Batt_Power_mW' in df.columns:
+        df.dropna(subset=['Batt_Power_mW'], inplace=True)
+    else:
+        print("WARNING: No battery power column found - checking available columns")
+        print(f"Available columns: {list(df.columns)}")
+        # Use any power column as fallback
+        power_cols = [col for col in df.columns if 'Power' in col and 'mW' in col]
+        if power_cols:
+            df.dropna(subset=[power_cols[0]], inplace=True)
+            print(f"Using fallback power column: {power_cols[0]}")
+        else:
+            print("ERROR: No power columns found in CSV file")
     
     print(f"INFO: Loaded {len(df)} valid measurements")
     return df

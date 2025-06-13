@@ -1,0 +1,25 @@
+SD Card Power Analysis Summary
+==============================
+
+Data file: test.csv
+Test Run ID: 2059
+Total measurements: 240
+Test states: MCU_Active_SD_Deinitialized, MCU_Active_SD_Idle_Standby, Sustained_SD_Write, Periodic_Batch_Write_Cycle
+
+Power Calculation Validation:
+Battery max error: 13.75%
+Load max error: 14.35%
+
+Average Power by State:
+MCU_Active_SD_Deinitialized:
+  Battery: 21.499 mW
+  Load: 18.007 mW
+MCU_Active_SD_Idle_Standby:
+  Battery: 21.507 mW
+  Load: 18.041 mW
+Periodic_Batch_Write_Cycle:
+  Battery: 21.475 mW
+  Load: 17.954 mW
+Sustained_SD_Write:
+  Battery: 21.475 mW
+  Load: 18.089 mW

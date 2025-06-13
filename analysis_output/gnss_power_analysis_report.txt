@@ -1,0 +1,54 @@
+============================================================
+GNSS POWER TRACKING ANALYSIS REPORT
+============================================================
+Generated: 2025-06-10 22:18:58
+Dataset: 1718 measurements
+
+DATA SUMMARY
+--------------------
+Recording Duration: 1799.5 seconds (30.0 minutes)
+Total Measurements: 1718
+Sampling Rate: ~1 Hz
+
+POWER FLOW ANALYSIS
+--------------------
+Solar Sensor:
+  Average Power: 0.00 mW
+  Peak Power: 0.03 mW
+  Minimum Power: 0.00 mW
+  Total Energy: 0.0000 mWh
+
+Battery Sensor:
+  Average Power: 117.42 mW
+  Peak Power: 142.58 mW
+  Minimum Power: 103.45 mW
+  Total Energy: 56.0336 mWh
+
+Load Sensor:
+  Average Power: 93.55 mW
+  Peak Power: 110.14 mW
+  Minimum Power: 84.53 mW
+  Total Energy: 44.6419 mWh
+
+System Efficiency: 535702966.67%
+
+POWER CORRELATIONS
+--------------------
+Solar vs Battery: 0.007
+Battery vs Load: 0.438
+Solar vs Load: -0.037
+
+GNSS POWER CORRELATION
+--------------------
+GNSS Active Periods: 318 measurements
+GNSS Inactive Periods: 1400 measurements
+Estimated GNSS Power: 0.00 mW
+
+SYSTEM PERFORMANCE METRICS
+------------------------------
+Solar Power Utilization: 535702966.67%
+Battery to Load Efficiency: 79.67%
+
+============================================================
+END OF REPORT
+============================================================
