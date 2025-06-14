@@ -63,25 +63,25 @@ Croc_Tracker_Dev_ref/
    ```
 
 2. **Validate Your Current Sensors**
-   ```cpp
+```cpp
    // Use the sensor validation template
    // File: testing/hardware_validation/sensor_validation_template.cpp
    ```
 
 3. **Explore Reference Implementation**
-   ```cpp
+```cpp
    // Review the complete three-sensor system
    // File: firmware/reference_implementations/sd_power_monitoring_reference_implementation.cpp
    ```
 
 4. **Add New Sensors**
-   ```cpp
+```cpp
    // Copy and customize the sensor driver template
    // File: templates/sensor_drivers/sensor_driver_template.h
    ```
 
 5. **Integrate Multiple Sensors**
-   ```cpp
+```cpp
    // Use the multi-sensor integration template
    // File: templates/integration_examples/multi_sensor_template.cpp
    ```

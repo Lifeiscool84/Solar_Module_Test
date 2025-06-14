@@ -55,7 +55,7 @@ const float CURRENT_LSB = MAX_CURRENT_A / 524288.0;  // 19-bit resolution
 const uint32_t GNSS_SAMPLE_INTERVAL_MS = 5000;    // GNSS reading every 5 seconds
 const uint32_t POWER_SAMPLE_INTERVAL_MS = 1000;   // Power monitoring every 1 second
 const uint32_t STATUS_REPORT_INTERVAL_MS = 30000; // Status report every 30 seconds
-const uint32_t DEMO_DURATION_MINUTES = 30;        // Total demo duration
+const uint32_t DEMO_DURATION_MINUTES = 700;        // Total demo duration
 const char CSV_FILENAME[] = "gnss_power_demo.csv";
 
 // Timezone Configuration - Central Time Zone
@@ -108,12 +108,20 @@ SdFat SD;
 bool demo_active = true;
 bool gnss_initialization_successful = false;
 bool rtc_initialization_successful = false;
+bool sd_card_available = false;  // Track SD card availability
 uint32_t demo_start_time = 0;
 uint32_t last_gnss_sample = 0;
 uint32_t last_power_sample = 0;
 uint32_t last_status_report = 0;
 uint32_t total_gnss_readings = 0;
 uint32_t successful_gnss_fixes = 0;
+
+// Time Synchronization Management
+bool gnss_time_available = false;           // GNSS time validity
+bool rtc_synced_with_gnss = false;          // RTC sync status
+uint32_t last_time_sync = 0;                // Last sync attempt
+const uint32_t TIME_SYNC_INTERVAL_MS = 300000; // Sync every 5 minutes
+bool rtc_stores_utc = true;                 // Will be determined automatically
 
 // Power Monitoring Functions (Enhanced from sd_power_test_essentials.cpp)
 bool ina228_writeRegister16(uint8_t address, uint8_t reg, uint16_t value) {
@@ -207,13 +215,175 @@ float ina228_readPower(uint8_t address) {
     return (float)(raw * powerLSB * 1000.0);  // Convert to mW
 }
 
-// RTC Functions (Simplified from professional driver)
-String getCurrentTimestamp() {
-    if (!rtc_initialization_successful) {
-        return "RTC_NOT_AVAILABLE";
+// GNSS Time Functions
+struct GNSSTimeData {
+    uint16_t year;
+    uint8_t month;
+    uint8_t day;
+    uint8_t hour;
+    uint8_t minute;
+    uint8_t second;
+    int32_t nanosecond;
+    bool time_valid;
+    bool time_confirmed;
+};
+
+bool getGNSSTime(GNSSTimeData& time_data) {
+    if (!gnss_initialization_successful) {
+        return false;
     }
     
-    // Get current time from RTC
+    time_data.year = gnss.getYear();
+    time_data.month = gnss.getMonth();
+    time_data.day = gnss.getDay();
+    time_data.hour = gnss.getHour();
+    time_data.minute = gnss.getMinute();
+    time_data.second = gnss.getSecond();
+    time_data.nanosecond = gnss.getNanosecond();
+    
+    time_data.time_valid = gnss.getTimeValid();
+    time_data.time_confirmed = gnss.getConfirmedTime();
+    
+    return time_data.time_valid;
+}
+
+// Time Synchronization Function
+bool syncRTCWithGNSS() {
+    if (!gnss_initialization_successful || !rtc_initialization_successful) {
+        return false;
+    }
+    
+    GNSSTimeData gnss_time;
+    if (!getGNSSTime(gnss_time) || !gnss_time.time_confirmed) {
+        return false;
+    }
+    
+    // Set RTC to GNSS UTC time
+    rtc.setTime(gnss_time.second, gnss_time.minute, gnss_time.hour, 
+                0, // weekday (not used)
+                gnss_time.day, gnss_time.month, gnss_time.year - 2000);
+    
+    rtc_synced_with_gnss = true;
+    rtc_stores_utc = true;  // After sync, RTC definitely stores UTC
+    last_time_sync = millis();
+    
+    Serial.println(F("RTC synchronized with GNSS UTC time"));
+    return true;
+}
+
+// Determine if RTC is storing UTC or local time
+void determineRTCTimeFormat() {
+    if (!gnss_initialization_successful || !rtc_initialization_successful) {
+        Serial.println(F("Cannot determine RTC format - using default assumption"));
+        return;
+    }
+    
+    GNSSTimeData gnss_time;
+    if (!getGNSSTime(gnss_time) || !gnss_time.time_valid) {
+        Serial.println(F("GNSS time not available - assuming RTC is UTC"));
+        return;
+    }
+    
+    // Read current RTC time
+    if (!rtc.updateTime()) {
+        Serial.println(F("Cannot read RTC time"));
+        return;
+    }
+    
+    int rtc_hour = rtc.getHours();
+    int gnss_hour = gnss_time.hour;
+    
+    // Calculate hour difference
+    int hour_diff = rtc_hour - gnss_hour;
+    
+    // Handle day boundary crossings
+    if (hour_diff > 12) hour_diff -= 24;
+    if (hour_diff < -12) hour_diff += 24;
+    
+    // If difference is close to timezone offset, RTC is in local time
+    int expected_offset = isDST ? CDT_OFFSET_HOURS : CST_OFFSET_HOURS;
+    
+    if (abs(hour_diff - expected_offset) <= 1) {
+        rtc_stores_utc = false;
+        Serial.print(F("RTC stores LOCAL time ("));
+        Serial.print(hour_diff);
+        Serial.println(F(" hour offset from UTC)"));
+    } else if (abs(hour_diff) <= 1) {
+        rtc_stores_utc = true;
+        Serial.println(F("RTC stores UTC time"));
+    } else {
+        Serial.print(F("RTC time unclear - "));
+        Serial.print(hour_diff);
+        Serial.println(F(" hour difference from GNSS"));
+    }
+}
+
+// Enhanced RTC Functions with Time Synchronization
+String getCurrentTimestamp() {
+    // Try to use GNSS time first if available and valid
+    if (gnss_initialization_successful) {
+        GNSSTimeData gnss_time;
+        if (getGNSSTime(gnss_time) && gnss_time.time_valid) {
+            gnss_time_available = true;
+            
+            // Convert GNSS UTC time to local time
+            int hour = gnss_time.hour;
+            int day = gnss_time.day;
+            int month = gnss_time.month;
+            int year = gnss_time.year;
+            
+            // Apply timezone offset to convert UTC to local time
+            int timezone_offset = isDST ? CDT_OFFSET_HOURS : CST_OFFSET_HOURS;
+            hour += timezone_offset;
+            
+            // Handle day/month/year rollover
+            if (hour < 0) {
+                hour += 24;
+                day--;
+                if (day < 1) {
+                    month--;
+                    if (month < 1) {
+                        month = 12;
+                        year--;
+                    }
+                    // Simplified - assume 30 days per month for rollover
+                    day = 30;
+                }
+            } else if (hour >= 24) {
+                hour -= 24;
+                day++;
+                if (day > 30) {  // Simplified month boundary
+                    day = 1;
+                    month++;
+                    if (month > 12) {
+                        month = 1;
+                        year++;
+                    }
+                }
+            }
+            
+            // Format timestamp with GNSS-derived time
+            String timestamp = String(year) + "-";
+            if (month < 10) timestamp += "0";
+            timestamp += String(month) + "-";
+            if (day < 10) timestamp += "0";
+            timestamp += String(day) + " ";
+            if (hour < 10) timestamp += "0";
+            timestamp += String(hour) + ":";
+            if (gnss_time.minute < 10) timestamp += "0";
+            timestamp += String(gnss_time.minute) + ":";
+            if (gnss_time.second < 10) timestamp += "0";
+            timestamp += String(gnss_time.second);
+            
+            return timestamp;
+        }
+    }
+    
+    // Fall back to RTC if GNSS time not available
+    if (!rtc_initialization_successful) {
+        return "TIME_NOT_AVAILABLE";
+    }
+    
     if (rtc.updateTime()) {
         int year = rtc.getYear();
         int month = rtc.getMonth();
@@ -222,38 +392,39 @@ String getCurrentTimestamp() {
         int minute = rtc.getMinutes();
         int second = rtc.getSeconds();
         
-        // Apply timezone offset (convert UTC to local time)
-        // CDT = UTC-5, CST = UTC-6 (subtract from UTC to get local time)
-        int timezone_offset = isDST ? CDT_OFFSET_HOURS : CST_OFFSET_HOURS;
-        hour += timezone_offset;  // Add negative offset to subtract from UTC
-        
-        // Handle day rollover
-        if (hour < 0) {
-            hour += 24;
-            day--;
-        } else if (hour >= 24) {
-            hour -= 24;
-            day++;
+        // Apply timezone conversion only if RTC stores UTC
+        if (rtc_stores_utc) {
+            int timezone_offset = isDST ? CDT_OFFSET_HOURS : CST_OFFSET_HOURS;
+            hour += timezone_offset;
+            
+            // Handle day rollover
+            if (hour < 0) {
+                hour += 24;
+                day--;
+            } else if (hour >= 24) {
+                hour -= 24;
+                day++;
+            }
         }
+        // If RTC stores local time, use it directly
         
-        // Format as simple 24-hour format: YYYY-MM-DD HH:MM:SS
-        // Note: RV8803 library returns full 4-digit year, not 2-digit offset
+        // Format timestamp
         String timestamp = String(year) + "-";
         if (month < 10) timestamp += "0";
         timestamp += String(month) + "-";
         if (day < 10) timestamp += "0";
-        timestamp += String(day) + " ";  // Space instead of 'T'
+        timestamp += String(day) + " ";
         if (hour < 10) timestamp += "0";
         timestamp += String(hour) + ":";
         if (minute < 10) timestamp += "0";
         timestamp += String(minute) + ":";
         if (second < 10) timestamp += "0";
         timestamp += String(second);
-        // Removed timezone offset for cleaner format
         
         return timestamp;
     }
-    return "RTC_READ_ERROR";
+    
+    return "TIME_READ_ERROR";
 }
 
 // GNSS Functions (Simplified from professional driver)
@@ -295,6 +466,11 @@ bool initializeCSVLogging() {
 }
 
 bool logGNSSPowerEntry(const GNSSPowerLogEntry& entry) {
+    // Check if SD card is available for logging
+    if (!sd_card_available) {
+        return false;  // SD card not available, skip logging
+    }
+    
     File32 logFile = SD.open(CSV_FILENAME, O_WRONLY | O_APPEND);
     if (!logFile) return false;
     
@@ -377,14 +553,7 @@ bool initializeSystem() {
             Serial.print(rtc.stringDateUSA());
             Serial.print(F(" "));
             Serial.print(rtc.stringTime());
-            Serial.print(F(" (UTC)"));
             Serial.println();
-            
-            // Show local time
-            Serial.print(F("Local time ("));
-            Serial.print(isDST ? "CDT UTC-5" : "CST UTC-6");
-            Serial.print(F("): "));
-            Serial.println(getCurrentTimestamp());
         }
     } else {
         Serial.println(F("WARNING: RTC initialization failed"));
@@ -402,9 +571,41 @@ bool initializeSystem() {
         gnss.setAutoPVT(true);
         
         Serial.println(F("GNSS configured for 1Hz position updates"));
+        
+        // Wait a moment for GNSS to start providing data
+        delay(2000);
+        
+        // Check GNSS time availability and determine RTC format
+        Serial.println(F("\n=== Time Synchronization Setup ==="));
+        if (rtc_initialization_successful) {
+            determineRTCTimeFormat();
+            
+            // Attempt initial time synchronization
+            if (syncRTCWithGNSS()) {
+                Serial.println(F("Initial GNSS-RTC synchronization successful"));
+            } else {
+                Serial.println(F("Initial GNSS-RTC synchronization failed - will retry later"));
+            }
+        }
+        
+        // Show current time information
+        Serial.print(F("Current timestamp: "));
+        Serial.println(getCurrentTimestamp());
+        
+        if (gnss_time_available) {
+            Serial.println(F("Time source: GNSS (satellite-accurate)"));
+        } else if (rtc_initialization_successful) {
+            Serial.print(F("Time source: RTC ("));
+            Serial.print(rtc_stores_utc ? "UTC" : "Local");
+            Serial.println(F(" format)"));
+        } else {
+            Serial.println(F("Time source: Not available"));
+        }
+        
     } else {
         Serial.println(F("WARNING: GNSS initialization failed"));
         Serial.println(F("Demo will continue with power monitoring only"));
+        Serial.println(F("Time will use RTC only (no satellite synchronization)"));
         gnss_initialization_successful = false;
     }
     
@@ -414,18 +615,27 @@ bool initializeSystem() {
     if (!initializeINA228(INA228_BATTERY_ADDRESS, "Battery")) return false;
     if (!initializeINA228(INA228_LOAD_ADDRESS, "Load")) return false;
     
-    // Initialize SD card
+    // Initialize SD card (optional - system continues without it)
     Serial.println(F("\n=== SD Card Initialization ==="));
-    if (!SD.begin(SD_CS_PIN)) {
-        Serial.println(F("FATAL ERROR: SD card initialization failed"));
-        return false;
+    if (SD.begin(SD_CS_PIN)) {
+        Serial.println(F("SD card initialized successfully"));
+        sd_card_available = true;
+        
+        if (initializeCSVLogging()) {
+            Serial.println(F("CSV logging initialized successfully"));
+        } else {
+            Serial.println(F("WARNING: CSV logging initialization failed"));
+            Serial.println(F("Data will only be displayed on serial monitor"));
+            sd_card_available = false;
+        }
+    } else {
+        Serial.println(F("WARNING: SD card initialization failed"));
+        Serial.println(F("System will continue without data logging to SD card"));
+        Serial.println(F("Data will only be displayed on serial monitor"));
+        sd_card_available = false;
     }
-    Serial.println(F("SD card initialized successfully"));
     
-    if (!initializeCSVLogging()) {
-        Serial.println(F("FATAL ERROR: CSV logging initialization failed"));
-        return false;
-    }
+    sd_card_available = true;
     
     Serial.println(F("\n=== System Initialization Complete ==="));
     return true;
@@ -497,10 +707,48 @@ void collectIntegratedData() {
         entry.fix_type = 0;
     }
     
-    // Log data to SD card
-    if (!logGNSSPowerEntry(entry)) {
-        Serial.println(F("WARNING: Failed to log data"));
+    // Log data to SD card if available
+    bool logged_to_sd = logGNSSPowerEntry(entry);
+    
+    // Always output data to serial monitor for real-time monitoring
+    Serial.print(F("["));
+    Serial.print(entry.timestamp_iso8601);
+    Serial.print(F("] "));
+    
+    // GNSS data
+    if (entry.gnss_reading_valid) {
+        Serial.print(F("GNSS: "));
+        Serial.print(entry.latitude_deg, 6);
+        Serial.print(F(","));
+        Serial.print(entry.longitude_deg, 6);
+        Serial.print(F(" Alt:"));
+        Serial.print(entry.altitude_m, 1);
+        Serial.print(F("m Sats:"));
+        Serial.print(entry.satellites_used);
+        Serial.print(F(" | "));
+    } else {
+        Serial.print(F("GNSS: No Fix | "));
     }
+    
+    // Power data
+    Serial.print(F("Power: S:"));
+    Serial.print(entry.solar_power_mW, 1);
+    Serial.print(F("mW B:"));
+    Serial.print(entry.battery_power_mW, 1);
+    Serial.print(F("mW L:"));
+    Serial.print(entry.load_power_mW, 1);
+    Serial.print(F("mW"));
+    
+    // Logging status
+    if (!sd_card_available) {
+        Serial.print(F(" [SD:OFF]"));
+    } else if (!logged_to_sd) {
+        Serial.print(F(" [SD:FAIL]"));
+    } else {
+        Serial.print(F(" [SD:OK]"));
+    }
+    
+    Serial.println();
 }
 
 // Status Reporting Function
@@ -562,6 +810,31 @@ void printStatusReport() {
     Serial.print(current_load_power, 2);
     Serial.println(F("mW"));
     
+    // SD card logging status
+    Serial.print(F("SD Card Logging: "));
+    if (sd_card_available) {
+        Serial.println(F("ACTIVE"));
+    } else {
+        Serial.println(F("DISABLED (No SD card)"));
+    }
+    
+    // Time synchronization status
+    Serial.print(F("Time Source: "));
+    if (gnss_time_available) {
+        Serial.print(F("GNSS (accurate)"));
+        if (rtc_synced_with_gnss) {
+            Serial.println(F(" + RTC synced"));
+        } else {
+            Serial.println(F(" + RTC not synced"));
+        }
+    } else if (rtc_initialization_successful) {
+        Serial.print(F("RTC only ("));
+        Serial.print(rtc_stores_utc ? "UTC" : "Local");
+        Serial.println(F(" format)"));
+    } else {
+        Serial.println(F("Not available"));
+    }
+    
     Serial.println(F("=========================================="));
 }
 
@@ -590,11 +863,24 @@ void setup() {
     Serial.print(F("Power Sampling: Every "));
     Serial.print(POWER_SAMPLE_INTERVAL_MS / 1000);
     Serial.println(F(" seconds"));
-    Serial.print(F("Data Logging: "));
-    Serial.println(CSV_FILENAME);
+    
+    // Show logging status
+    if (sd_card_available) {
+        Serial.print(F("Data Logging: CSV file "));
+        Serial.println(CSV_FILENAME);
+        Serial.println(F("Data will be logged to SD card AND displayed on serial"));
+    } else {
+        Serial.println(F("Data Logging: SD card not available"));
+        Serial.println(F("Data will ONLY be displayed on serial monitor"));
+    }
     
     if (gnss_initialization_successful) {
         Serial.println(F("\nWaiting for GNSS fix... (may take up to 90 seconds)"));
+        if (gnss_time_available) {
+            Serial.println(F("GNSS time is available - timestamps will be satellite-accurate"));
+        } else {
+            Serial.println(F("GNSS time not yet available - using RTC for now"));
+        }
     }
     
     Serial.println(F("Press 's' for status, 'q' to quit demo, 't' to toggle timezone"));
@@ -612,8 +898,12 @@ void loop() {
     
     if (!demo_active) {
         Serial.println(F("\n=== Demo Complete ==="));
-        Serial.print(F("Data logged to: "));
-        Serial.println(CSV_FILENAME);
+        if (sd_card_available) {
+            Serial.print(F("Data logged to: "));
+            Serial.println(CSV_FILENAME);
+        } else {
+            Serial.println(F("Data was displayed on serial monitor only (no SD card)"));
+        }
         Serial.println(F("System will halt. Reset to run again."));
         while (1) delay(1000);
     }
@@ -636,6 +926,14 @@ void loop() {
     if (current_time - last_power_sample >= POWER_SAMPLE_INTERVAL_MS) {
         collectIntegratedData();
         last_power_sample = current_time;
+    }
+    
+    // Periodic time synchronization
+    if (gnss_initialization_successful && rtc_initialization_successful && 
+        (current_time - last_time_sync >= TIME_SYNC_INTERVAL_MS)) {
+        if (syncRTCWithGNSS()) {
+            Serial.println(F("Periodic GNSS-RTC synchronization completed"));
+        }
     }
     
     // Periodic status reports

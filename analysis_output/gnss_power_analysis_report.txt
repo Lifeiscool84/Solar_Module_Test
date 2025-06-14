@@ -1,53 +1,53 @@
 ============================================================
 GNSS POWER TRACKING ANALYSIS REPORT
 ============================================================
-Generated: 2025-06-10 22:18:58
-Dataset: 1718 measurements
+Generated: 2025-06-14 00:17:02
+Dataset: 33939 measurements
 
 DATA SUMMARY
 --------------------
-Recording Duration: 1799.5 seconds (30.0 minutes)
-Total Measurements: 1718
+Recording Duration: 31204.2 seconds (520.1 minutes)
+Total Measurements: 33939
 Sampling Rate: ~1 Hz
 
 POWER FLOW ANALYSIS
 --------------------
 Solar Sensor:
-  Average Power: 0.00 mW
-  Peak Power: 0.03 mW
+  Average Power: 12.08 mW
+  Peak Power: 102.60 mW
   Minimum Power: 0.00 mW
-  Total Energy: 0.0000 mWh
+  Total Energy: 113.8865 mWh
 
 Battery Sensor:
-  Average Power: 117.42 mW
+  Average Power: 86.06 mW
   Peak Power: 142.58 mW
-  Minimum Power: 103.45 mW
-  Total Energy: 56.0336 mWh
+  Minimum Power: 0.00 mW
+  Total Energy: 811.3132 mWh
 
 Load Sensor:
-  Average Power: 93.55 mW
-  Peak Power: 110.14 mW
-  Minimum Power: 84.53 mW
-  Total Energy: 44.6419 mWh
+  Average Power: 77.33 mW
+  Peak Power: 114.38 mW
+  Minimum Power: 0.40 mW
+  Total Energy: 728.9951 mWh
 
-System Efficiency: 535702966.67%
+System Efficiency: 640.11%
 
 POWER CORRELATIONS
 --------------------
-Solar vs Battery: 0.007
-Battery vs Load: 0.438
-Solar vs Load: -0.037
+Solar vs Battery: -0.420
+Battery vs Load: 0.796
+Solar vs Load: 0.194
 
 GNSS POWER CORRELATION
 --------------------
-GNSS Active Periods: 318 measurements
-GNSS Inactive Periods: 1400 measurements
-Estimated GNSS Power: 0.00 mW
+GNSS Active Periods: 6311 measurements
+GNSS Inactive Periods: 27628 measurements
+Estimated GNSS Power: 6.21 mW
 
 SYSTEM PERFORMANCE METRICS
 ------------------------------
-Solar Power Utilization: 535702966.67%
-Battery to Load Efficiency: 79.67%
+Solar Power Utilization: 640.11%
+Battery to Load Efficiency: 89.85%
 
 ============================================================
 END OF REPORT
